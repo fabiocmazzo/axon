@@ -1,7 +1,7 @@
 use anyhow::Result;
 use axon::isa::{
-    op_commit, op_filter, op_load, op_match, op_purge, op_scan, op_sub, op_xexec, FilterOpts,
-    ScanOpts,
+    op_commit, op_filter, op_load_with_context, op_match, op_outline, op_patch, op_purge, op_scan,
+    op_set_algebra, op_sub, op_undo, op_xexec, FilterOpts, ScanOpts, SetOp,
 };
 use axon::reg::{RegRef, RegisterRecord};
 use axon::shm::ShmStore;
@@ -75,6 +75,30 @@ enum Commands {
         max_size: Option<u64>,
     },
 
+    /// Compute set union of two SSA registers into a new register
+    Union {
+        /// First register (e.g. r0)
+        reg_a: String,
+        /// Second register (e.g. r1)
+        reg_b: String,
+    },
+
+    /// Compute set intersection of two SSA registers into a new register
+    Intersect {
+        /// First register (e.g. r0)
+        reg_a: String,
+        /// Second register (e.g. r1)
+        reg_b: String,
+    },
+
+    /// Compute set difference (reg_a \ reg_b) into a new SSA register
+    Diff {
+        /// First register (e.g. r0)
+        reg_a: String,
+        /// Second register to subtract (e.g. r1)
+        reg_b: String,
+    },
+
     /// Search pattern across a register or path into a new MatchSet SSA register (replaces `grep`)
     Match {
         /// Source register (e.g. r0, @r0, @last) or filesystem path
@@ -88,7 +112,14 @@ enum Commands {
         fixed: bool,
     },
 
-    /// Load file contents or line slices into a new TextBuf SSA register (replaces `cat`/`head`/`tail`)
+    /// Extract structural symbol declarations (fn, struct, enum, trait, impl, class, def) into a MatchSet
+    Outline {
+        /// Source register (e.g. r0, @last) or filesystem path
+        #[arg(default_value = "@last")]
+        target: String,
+    },
+
+    /// Load file contents, line ranges, or ±N context windows around a MatchSet into a TextBuf register
     Load {
         /// Source register (e.g. r0, @r0, @last, r0[0]) or file path
         target: String,
@@ -100,6 +131,10 @@ enum Commands {
         /// 1-based end line (inclusive)
         #[arg(short = 'e', long)]
         end_line: Option<usize>,
+
+        /// Context lines (±N) to load around each match in a MatchSet (merges overlapping windows)
+        #[arg(short = 'C', long)]
+        context: Option<usize>,
     },
 
     /// Stage regex/fixed substitutions in SSA memory into a DiffSet register without touching disk (replaces `sed`)
@@ -118,10 +153,39 @@ enum Commands {
         fixed: bool,
     },
 
-    /// Atomically apply a staged DiffSet register to disk
+    /// Stage surgical line-range replacement in SSA memory into a DiffSet register without touching disk
+    Patch {
+        /// Source register (e.g. r0[0]) or file path
+        target: String,
+
+        /// 1-based start line to replace (inclusive)
+        #[arg(short = 's', long)]
+        start_line: usize,
+
+        /// 1-based end line to replace (inclusive; defaults to start_line)
+        #[arg(short = 'e', long)]
+        end_line: Option<usize>,
+
+        /// Replacement text for the line range
+        #[arg(short = 'w', long)]
+        with: String,
+    },
+
+    /// Verify CAS hashes and atomically apply a staged DiffSet register to disk
     Commit {
         /// DiffSet register to commit (e.g. r2, @r2, @last)
         diff_reg: String,
+    },
+
+    /// Atomically roll back a COMMIT (or DiffSet) register to its pre-commit state from /dev/shm
+    Undo {
+        /// COMMIT or DiffSet register to roll back (defaults to @last)
+        #[arg(default_value = "@last")]
+        reg: String,
+
+        /// Force rollback even if the file on disk was modified after COMMIT
+        #[arg(short, long)]
+        force: bool,
     },
 
     /// Delete files in a PathSet register (dry-run unless --force is passed; replaces `rm`)
@@ -222,6 +286,18 @@ fn main() -> Result<()> {
             )?;
             print_record(&rec, cli.json)?;
         }
+        Commands::Union { reg_a, reg_b } => {
+            let rec = op_set_algebra(&store, None, SetOp::Union, &reg_a, &reg_b)?;
+            print_record(&rec, cli.json)?;
+        }
+        Commands::Intersect { reg_a, reg_b } => {
+            let rec = op_set_algebra(&store, None, SetOp::Intersect, &reg_a, &reg_b)?;
+            print_record(&rec, cli.json)?;
+        }
+        Commands::Diff { reg_a, reg_b } => {
+            let rec = op_set_algebra(&store, None, SetOp::Diff, &reg_a, &reg_b)?;
+            print_record(&rec, cli.json)?;
+        }
         Commands::Match {
             target,
             pattern,
@@ -230,12 +306,18 @@ fn main() -> Result<()> {
             let rec = op_match(&store, None, &target, &pattern, fixed)?;
             print_record(&rec, cli.json)?;
         }
+        Commands::Outline { target } => {
+            let rec = op_outline(&store, None, &target)?;
+            print_record(&rec, cli.json)?;
+        }
         Commands::Load {
             target,
             start_line,
             end_line,
+            context,
         } => {
-            let rec = op_load(&store, None, &target, start_line, end_line)?;
+            let rec =
+                op_load_with_context(&store, None, &target, start_line, end_line, context)?;
             print_record(&rec, cli.json)?;
         }
         Commands::Sub {
@@ -247,8 +329,28 @@ fn main() -> Result<()> {
             let rec = op_sub(&store, None, &target, &pattern, &replacement, fixed)?;
             print_record(&rec, cli.json)?;
         }
+        Commands::Patch {
+            target,
+            start_line,
+            end_line,
+            with,
+        } => {
+            let rec = op_patch(
+                &store,
+                None,
+                &target,
+                start_line,
+                end_line.unwrap_or(start_line),
+                &with,
+            )?;
+            print_record(&rec, cli.json)?;
+        }
         Commands::Commit { diff_reg } => {
             let rec = op_commit(&store, None, &diff_reg)?;
+            print_record(&rec, cli.json)?;
+        }
+        Commands::Undo { reg, force } => {
+            let rec = op_undo(&store, None, &reg, force)?;
             print_record(&rec, cli.json)?;
         }
         Commands::Purge { reg, force } => {
@@ -283,10 +385,7 @@ fn main() -> Result<()> {
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&list)?);
             } else if list.is_empty() {
-                println!(
-                    "No SSA registers allocated in {}",
-                    store.root().display()
-                );
+                println!("No SSA registers allocated in {}", store.root().display());
             } else {
                 for entry in list {
                     println!(

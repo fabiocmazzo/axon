@@ -1,6 +1,6 @@
 use crate::isa::{
-    op_commit, op_filter, op_load, op_match, op_purge, op_scan, op_sub, op_xexec, FilterOpts,
-    ScanOpts,
+    op_commit, op_filter, op_load_with_context, op_match, op_outline, op_patch, op_purge, op_scan,
+    op_set_algebra, op_sub, op_undo, op_xexec, FilterOpts, ScanOpts, SetOp,
 };
 use crate::reg::{RegRef, RegisterRecord};
 use crate::shm::ShmStore;
@@ -74,9 +74,22 @@ pub fn tokenize_instruction(stmt: &str) -> Result<Vec<String>> {
     while let Some(ch) = chars.next() {
         if ch == '\\' && (in_single || in_double) {
             if let Some(&next_ch) = chars.peek() {
-                if next_ch == '"' || next_ch == '\'' || next_ch == '\\' {
-                    current.push(chars.next().unwrap());
-                    continue;
+                match next_ch {
+                    '"' | '\'' | '\\' => {
+                        current.push(chars.next().unwrap());
+                        continue;
+                    }
+                    'n' => {
+                        let _ = chars.next();
+                        current.push('\n');
+                        continue;
+                    }
+                    't' => {
+                        let _ = chars.next();
+                        current.push('\t');
+                        continue;
+                    }
+                    _ => {}
                 }
             }
             current.push(ch);
@@ -259,6 +272,22 @@ pub fn execute_program(store: &ShmStore, script_or_path: &str) -> Result<Vec<VmS
                     text_output: None,
                 }
             }
+            "UNION" | "INTERSECT" | "DIFF" => {
+                if args.len() != 2 {
+                    bail!("{op} requires <reg_a> <reg_b>");
+                }
+                let set_op = match op.as_str() {
+                    "UNION" => SetOp::Union,
+                    "INTERSECT" => SetOp::Intersect,
+                    _ => SetOp::Diff,
+                };
+                let rec = op_set_algebra(store, explicit_id, set_op, &args[0], &args[1])?;
+                VmStepOutput {
+                    instruction: stmt,
+                    register: Some(rec),
+                    text_output: None,
+                }
+            }
             "MATCH" | "GREP" => {
                 if args.len() < 2 {
                     bail!("MATCH requires <reg_or_path> <pattern> [--fixed]");
@@ -273,6 +302,15 @@ pub fn execute_program(store: &ShmStore, script_or_path: &str) -> Result<Vec<VmS
                     text_output: None,
                 }
             }
+            "OUTLINE" | "SYMBOLS" => {
+                let target = args.first().map(|s| s.as_str()).unwrap_or("@last");
+                let rec = op_outline(store, explicit_id, target)?;
+                VmStepOutput {
+                    instruction: stmt,
+                    register: Some(rec),
+                    text_output: None,
+                }
+            }
             "LOAD" | "READ" | "CAT" => {
                 if args.is_empty() {
                     bail!("LOAD requires <reg_or_path>");
@@ -280,6 +318,7 @@ pub fn execute_program(store: &ShmStore, script_or_path: &str) -> Result<Vec<VmS
                 let target = &args[0];
                 let mut start_line = None;
                 let mut end_line = None;
+                let mut context = None;
                 let mut i = 1;
                 while i < args.len() {
                     match args[i].as_str() {
@@ -299,11 +338,20 @@ pub fn execute_program(store: &ShmStore, script_or_path: &str) -> Result<Vec<VmS
                                     .parse()?,
                             );
                         }
+                        "--context" | "-C" => {
+                            i += 1;
+                            context = Some(
+                                args.get(i)
+                                    .ok_or_else(|| anyhow!("LOAD --context requires a number"))?
+                                    .parse()?,
+                            );
+                        }
                         other => bail!("Unexpected argument '{other}' in LOAD"),
                     }
                     i += 1;
                 }
-                let rec = op_load(store, explicit_id, target, start_line, end_line)?;
+                let rec =
+                    op_load_with_context(store, explicit_id, target, start_line, end_line, context)?;
                 VmStepOutput {
                     instruction: stmt,
                     register: Some(rec),
@@ -325,11 +373,78 @@ pub fn execute_program(store: &ShmStore, script_or_path: &str) -> Result<Vec<VmS
                     text_output: None,
                 }
             }
+            "PATCH" => {
+                if args.is_empty() {
+                    bail!("PATCH requires <reg_or_path> --start-line <A> --end-line <B> --with <TEXT> (or <reg> <A> <B> <TEXT>)");
+                }
+                let target = &args[0];
+                let mut start_line: Option<usize> = None;
+                let mut end_line: Option<usize> = None;
+                let mut replacement: Option<String> = None;
+
+                if args.len() == 4 && !args[1].starts_with('-') {
+                    start_line = Some(args[1].parse()?);
+                    end_line = Some(args[2].parse()?);
+                    replacement = Some(args[3].clone());
+                } else {
+                    let mut i = 1;
+                    while i < args.len() {
+                        match args[i].as_str() {
+                            "--start-line" | "-s" => {
+                                i += 1;
+                                start_line = Some(
+                                    args.get(i)
+                                        .ok_or_else(|| anyhow!("PATCH --start-line requires line number"))?
+                                        .parse()?,
+                                );
+                            }
+                            "--end-line" | "-e" => {
+                                i += 1;
+                                end_line = Some(
+                                    args.get(i)
+                                        .ok_or_else(|| anyhow!("PATCH --end-line requires line number"))?
+                                        .parse()?,
+                                );
+                            }
+                            "--with" | "-w" => {
+                                i += 1;
+                                replacement = Some(
+                                    args.get(i)
+                                        .ok_or_else(|| anyhow!("PATCH --with requires replacement text"))?
+                                        .clone(),
+                                );
+                            }
+                            other => bail!("Unexpected argument '{other}' in PATCH"),
+                        }
+                        i += 1;
+                    }
+                }
+
+                let s = start_line.ok_or_else(|| anyhow!("PATCH missing --start-line"))?;
+                let e = end_line.unwrap_or(s);
+                let rep = replacement.ok_or_else(|| anyhow!("PATCH missing --with replacement"))?;
+                let rec = op_patch(store, explicit_id, target, s, e, &rep)?;
+                VmStepOutput {
+                    instruction: stmt,
+                    register: Some(rec),
+                    text_output: None,
+                }
+            }
             "COMMIT" | "APPLY" => {
                 if args.is_empty() {
                     bail!("COMMIT requires <diff_reg>");
                 }
                 let rec = op_commit(store, explicit_id, &args[0])?;
+                VmStepOutput {
+                    instruction: stmt,
+                    register: Some(rec),
+                    text_output: None,
+                }
+            }
+            "UNDO" | "ROLLBACK" => {
+                let target = args.first().map(|s| s.as_str()).unwrap_or("@last");
+                let force = args.iter().skip(1).any(|a| a == "--force" || a == "-f");
+                let rec = op_undo(store, explicit_id, target, force)?;
                 VmStepOutput {
                     instruction: stmt,
                     register: Some(rec),

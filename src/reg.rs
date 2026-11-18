@@ -3,6 +3,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt;
 
+/// Deterministic 64-bit FNV-1a hash for Compare-And-Swap (CAS) conflict detection.
+pub fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x00000100000001b3;
+    let mut hash = OFFSET_BASIS;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
 /// Parsed reference to a register in the SSA register file, optionally with an item index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegRef {
@@ -61,7 +73,9 @@ impl RegRef {
         }
         // Only treat unprefixed `r<digits>` (or `r<digits>[idx]`) as a register reference
         // if it parses cleanly and does not exist as a literal path on disk.
-        if (trimmed.starts_with('r') || trimmed.starts_with('R') || trimmed.eq_ignore_ascii_case("last"))
+        if (trimmed.starts_with('r')
+            || trimmed.starts_with('R')
+            || trimmed.eq_ignore_ascii_case("last"))
             && Self::parse(trimmed).is_ok()
         {
             return !std::path::Path::new(trimmed).exists();
@@ -98,8 +112,93 @@ pub struct FileSlice {
 pub struct FilePatch {
     pub path: String,
     pub replacements: usize,
+    pub base_hash: u64,
+    pub modified_hash: u64,
     pub original: String,
     pub modified: String,
+}
+
+impl FilePatch {
+    pub fn new(path: String, replacements: usize, original: String, modified: String) -> Self {
+        let base_hash = fnv1a_64(original.as_bytes());
+        let modified_hash = fnv1a_64(modified.as_bytes());
+        Self {
+            path,
+            replacements,
+            base_hash,
+            modified_hash,
+            original,
+            modified,
+        }
+    }
+
+    /// Render a compact, deterministic unified diff of changed lines for agent inspection.
+    pub fn render_unified_diff(&self, max_hunks: usize) -> String {
+        let old_lines: Vec<&str> = self.original.lines().collect();
+        let new_lines: Vec<&str> = self.modified.lines().collect();
+        let mut out = String::new();
+        out.push_str(&format!(
+            "      --- a/{}\n      +++ b/{}\n",
+            self.path, self.path
+        ));
+
+        // Find common prefix and suffix to isolate changed lines cleanly
+        let mut prefix = 0;
+        while prefix < old_lines.len()
+            && prefix < new_lines.len()
+            && old_lines[prefix] == new_lines[prefix]
+        {
+            prefix += 1;
+        }
+
+        let mut old_end = old_lines.len();
+        let mut new_end = new_lines.len();
+        while old_end > prefix
+            && new_end > prefix
+            && old_lines[old_end - 1] == new_lines[new_end - 1]
+        {
+            old_end -= 1;
+            new_end -= 1;
+        }
+
+        let old_slice = &old_lines[prefix..old_end];
+        let new_slice = &new_lines[prefix..new_end];
+
+        out.push_str(&format!(
+            "      @@ -{},{} +{},{} @@\n",
+            prefix + 1,
+            old_slice.len(),
+            prefix + 1,
+            new_slice.len()
+        ));
+
+        let mut shown = 0;
+        for (i, l) in old_slice.iter().enumerate() {
+            if shown >= max_hunks {
+                out.push_str("      ... (diff truncated)\n");
+                return out;
+            }
+            if i < new_slice.len() && *l == new_slice[i] {
+                out.push_str(&format!("        {l}\n"));
+            } else {
+                out.push_str(&format!("      - {l}\n"));
+                shown += 1;
+            }
+        }
+        for (i, l) in new_slice.iter().enumerate() {
+            if shown >= max_hunks {
+                out.push_str("      ... (diff truncated)\n");
+                return out;
+            }
+            if i < old_slice.len() && *l == old_slice[i] {
+                continue;
+            }
+            out.push_str(&format!("      + {l}\n"));
+            shown += 1;
+        }
+
+        out
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -266,17 +365,19 @@ impl RegisterRecord {
                         "  [{i}] {} (lines {}..={}):\n",
                         slice.path, slice.start_line, slice.end_line
                     ));
-                    for line in slice.content.lines() {
-                        out.push_str(&format!("      | {line}\n"));
+                    for (idx, line) in slice.content.lines().enumerate() {
+                        let line_no = slice.start_line + idx;
+                        out.push_str(&format!("      {:>4} | {line}\n", line_no));
                     }
                 }
             }
             RegValue::DiffSet(items) => {
                 for (i, patch) in items.iter().take(max_items).enumerate() {
                     out.push_str(&format!(
-                        "  [{i}] {} ({} replacement(s))\n",
-                        patch.path, patch.replacements
+                        "  [{i}] {} ({} replacement(s), base_hash: {:016x})\n",
+                        patch.path, patch.replacements, patch.base_hash
                     ));
+                    out.push_str(&patch.render_unified_diff(40));
                 }
             }
             RegValue::ExecResult(items) => {

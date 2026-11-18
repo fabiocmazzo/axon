@@ -1,6 +1,6 @@
 use axon::isa::{
-    op_commit, op_filter, op_load, op_match, op_purge, op_scan, op_sub, op_xexec, FilterOpts,
-    ScanOpts,
+    op_commit, op_filter, op_load, op_load_with_context, op_match, op_outline, op_patch, op_purge,
+    op_scan, op_set_algebra, op_sub, op_undo, op_xexec, FilterOpts, ScanOpts, SetOp,
 };
 use axon::reg::{RegRef, RegValue};
 use axon::shm::ShmStore;
@@ -259,4 +259,151 @@ fn test_ax_cli_binary_end_to_end() {
         .unwrap();
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("Cleared 4 SSA register(s)"));
+}
+
+#[test]
+fn test_contextual_load_around_matches_with_window_merging() {
+    let shm_tmp = tempdir().unwrap();
+    let work_tmp = tempdir().unwrap();
+    let file_p = work_tmp.path().join("service.rs");
+
+    // 10-line file with matches at lines 2, 3 (adjacent) and line 9 (distant)
+    let content = (1..=10)
+        .map(|i| {
+            if i == 2 || i == 3 || i == 9 {
+                format!("line {i} TARGET_TOKEN")
+            } else {
+                format!("line {i} normal")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&file_p, content).unwrap();
+
+    let store = ShmStore::open(Some(shm_tmp.path().to_path_buf())).unwrap();
+    let r0 = op_match(
+        &store,
+        None,
+        file_p.to_str().unwrap(),
+        "TARGET_TOKEN",
+        true,
+    )
+    .unwrap();
+    assert_eq!(r0.value.len(), 3);
+
+    // Load ±1 context around matches in r0:
+    // Matches at lines 2 and 3 with ±1 -> [1..=3] and [2..=4] -> merged into [1..=4]
+    // Match at line 9 with ±1 -> [8..=10]
+    let r1 = op_load_with_context(&store, None, &r0.name, None, None, Some(1)).unwrap();
+    if let RegValue::TextBuf(slices) = &r1.value {
+        assert_eq!(slices.len(), 2, "Expected 2 merged context windows");
+        assert_eq!((slices[0].start_line, slices[0].end_line), (1, 4));
+        assert_eq!((slices[1].start_line, slices[1].end_line), (8, 10));
+    } else {
+        panic!("Expected TextBuf");
+    }
+}
+
+#[test]
+fn test_patch_unified_diff_cas_conflict_and_atomic_undo() {
+    let shm_tmp = tempdir().unwrap();
+    let work_tmp = tempdir().unwrap();
+    let file_p = work_tmp.path().join("calc.rs");
+    let original = "fn a() {}\nfn b() {\n    let x = 1;\n}\nfn c() {}\n";
+    fs::write(&file_p, original).unwrap();
+
+    let store = ShmStore::open(Some(shm_tmp.path().to_path_buf())).unwrap();
+
+    // Stage surgical PATCH on lines 2..=4
+    let r0 = op_patch(
+        &store,
+        None,
+        file_p.to_str().unwrap(),
+        2,
+        4,
+        "fn b() {\n    let x = 99;\n}",
+    )
+    .unwrap();
+
+    // Verify unified diff rendering in inspect output
+    let inspect_txt = r0.format_inspect(None);
+    assert!(inspect_txt.contains("--- a/"));
+    assert!(inspect_txt.contains("+++ b/"));
+    assert!(inspect_txt.contains("-     let x = 1;"));
+    assert!(inspect_txt.contains("+     let x = 99;"));
+
+    // Simulate concurrent modification on disk before COMMIT -> must trigger CAS_CONFLICT
+    fs::write(&file_p, "fn a() { /* concurrent edit */ }\n").unwrap();
+    let conflict_err = op_commit(&store, None, &r0.name).unwrap_err();
+    assert!(
+        conflict_err.to_string().contains("CAS_CONFLICT"),
+        "Expected CAS_CONFLICT, got: {conflict_err}"
+    );
+
+    // Restore original file on disk so COMMIT succeeds
+    fs::write(&file_p, original).unwrap();
+    let r1_commit = op_commit(&store, None, &r0.name).unwrap();
+    assert!(fs::read_to_string(&file_p).unwrap().contains("let x = 99;"));
+
+    // Roll back via UNDO on the COMMIT register r1
+    let r2_undo = op_undo(&store, None, &r1_commit.name, false).unwrap();
+    assert_eq!(r2_undo.opcode, "UNDO");
+    assert_eq!(fs::read_to_string(&file_p).unwrap(), original);
+}
+
+#[test]
+fn test_ssa_set_algebra_and_outline() {
+    let shm_tmp = tempdir().unwrap();
+    let work_tmp = tempdir().unwrap();
+
+    let f_safe = work_tmp.path().join("safe.rs");
+    let f_unsafe = work_tmp.path().join("raw.rs");
+    fs::write(
+        &f_safe,
+        "pub struct SafeEngine;\npub fn run_safe() -> bool { true }\n",
+    )
+    .unwrap();
+    fs::write(
+        &f_unsafe,
+        "pub unsafe fn run_raw_ptr() {\n    // unsafe block\n}\n",
+    )
+    .unwrap();
+
+    let store = ShmStore::open(Some(shm_tmp.path().to_path_buf())).unwrap();
+
+    // r0 = all *.rs files (2 files)
+    let r0 = op_scan(
+        &store,
+        None,
+        &ScanOpts {
+            root: work_tmp.path().to_path_buf(),
+            glob: Some("*.rs".to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(r0.value.len(), 2);
+
+    // r1 = files matching "unsafe" (1 file: raw.rs)
+    let r1 = op_match(&store, None, &r0.name, "unsafe", true).unwrap();
+    assert_eq!(r1.value.extract_paths().len(), 1);
+
+    // r2 = DIFF r0 r1 -> only safe.rs
+    let r2 = op_set_algebra(&store, None, SetOp::Diff, &r0.name, &r1.name).unwrap();
+    assert_eq!(r2.value.len(), 1);
+    assert!(r2.value.extract_paths()[0].ends_with("safe.rs"));
+
+    // r3 = INTERSECT r0 r1 -> only raw.rs
+    let r3 = op_set_algebra(&store, None, SetOp::Intersect, &r0.name, &r1.name).unwrap();
+    assert_eq!(r3.value.len(), 1);
+    assert!(r3.value.extract_paths()[0].ends_with("raw.rs"));
+
+    // r4 = UNION r2 r3 -> both files again
+    let r4 = op_set_algebra(&store, None, SetOp::Union, &r2.name, &r3.name).unwrap();
+    assert_eq!(r4.value.len(), 2);
+
+    // r5 = OUTLINE r2 -> extracts `pub struct SafeEngine;` and `pub fn run_safe()`
+    let r5 = op_outline(&store, None, &r2.name).unwrap();
+    assert_eq!(r5.opcode, "OUTLINE");
+    assert_eq!(r5.value.len(), 2);
 }
