@@ -1,7 +1,7 @@
 use axon::isa::{
-    op_commit, op_filter, op_load, op_load_with_context, op_match, op_outline, op_patch, op_purge,
-    op_scan, op_set_algebra, op_slice, op_sub, op_undo, op_verify, op_write, op_xexec, FilterOpts,
-    ScanOpts, SetOp,
+    op_commit, op_dirty, op_edit, op_filter, op_load, op_load_with_context, op_match, op_outline,
+    op_patch, op_purge, op_scan, op_set_algebra, op_slice, op_sub, op_undo, op_verify, op_write,
+    op_xexec, schema_spec, trace_lineage, FilterOpts, ScanOpts, SetOp,
 };
 use axon::reg::{RegRef, RegValue};
 use axon::shm::ShmStore;
@@ -606,4 +606,203 @@ fn test_slice_pagination_inspect_budget_and_shm_gc_stats() {
         execute_program(&store, &format!(r#"r0 = SCAN "{root_str}" "*.rs""#)).unwrap();
     assert_eq!(post_gc_steps[0].register.as_ref().unwrap().name, "r4");
     assert_eq!(post_gc_steps[0].virtual_reg.as_deref(), Some("r0"));
+}
+
+#[test]
+fn test_edit_unique_anchor_and_ambiguous_or_missing_errors() {
+    let shm_tmp = tempdir().unwrap();
+    let work_tmp = tempdir().unwrap();
+    let file_p = work_tmp.path().join("handler.rs");
+
+    fs::write(
+        &file_p,
+        "fn first() {\n    let v = 10;\n}\nfn second() {\n    let v = 10;\n}\n",
+    )
+    .unwrap();
+
+    let store = ShmStore::open(Some(shm_tmp.path().to_path_buf())).unwrap();
+    let target = file_p.to_str().unwrap();
+
+    // 1. Missing anchor -> ANCHOR_NOT_FOUND
+    let err_missing = op_edit(&store, None, target, "let v = 999;", "let v = 0;").unwrap_err();
+    assert!(
+        err_missing.to_string().contains("ANCHOR_NOT_FOUND"),
+        "Expected ANCHOR_NOT_FOUND, got: {err_missing}"
+    );
+
+    // 2. Ambiguous anchor (`let v = 10;` appears at lines 2 and 5) -> AMBIGUOUS_ANCHOR
+    let err_ambig = op_edit(&store, None, target, "let v = 10;", "let v = 20;").unwrap_err();
+    assert!(
+        err_ambig.to_string().contains("AMBIGUOUS_ANCHOR"),
+        "Expected AMBIGUOUS_ANCHOR, got: {err_ambig}"
+    );
+    assert!(
+        err_ambig.to_string().contains("[2, 5]"),
+        "Expected line numbers [2, 5] in error, got: {err_ambig}"
+    );
+
+    // 3. Unique anchor with surrounding function header -> succeeds!
+    let r0 = op_edit(
+        &store,
+        None,
+        target,
+        "fn second() {\n    let v = 10;\n}",
+        "fn second() {\n    let v = 42;\n}",
+    )
+    .unwrap();
+    assert_eq!(r0.opcode, "EDIT");
+    let _r1 = op_commit(&store, None, &r0.name).unwrap();
+    assert_eq!(
+        fs::read_to_string(&file_p).unwrap(),
+        "fn first() {\n    let v = 10;\n}\nfn second() {\n    let v = 42;\n}\n"
+    );
+}
+
+#[test]
+fn test_diffset_union_multi_file_and_same_file_transactional_verify() {
+    let shm_tmp = tempdir().unwrap();
+    let work_tmp = tempdir().unwrap();
+
+    let lib_file = work_tmp.path().join("lib.rs");
+    let new_mod = work_tmp.path().join("extra.rs");
+    let initial_lib = "pub fn a() -> i32 {\n    1\n}\n\npub fn b() -> i32 {\n    2\n}\n";
+    fs::write(&lib_file, initial_lib).unwrap();
+
+    let store = ShmStore::open(Some(shm_tmp.path().to_path_buf())).unwrap();
+
+    // r0: stage new file extra.rs
+    let r0 = op_write(
+        &store,
+        None,
+        new_mod.to_str().unwrap(),
+        "pub fn extra() -> i32 { 100 }",
+    )
+    .unwrap();
+
+    // r1: stage edit to fn a() in lib.rs
+    let r1 = op_edit(
+        &store,
+        None,
+        lib_file.to_str().unwrap(),
+        "pub fn a() -> i32 {\n    1\n}",
+        "pub fn a() -> i32 {\n    10\n}",
+    )
+    .unwrap();
+
+    // r2: stage independent edit to fn b() in the same lib.rs
+    let r2 = op_edit(
+        &store,
+        None,
+        lib_file.to_str().unwrap(),
+        "pub fn b() -> i32 {\n    2\n}",
+        "pub fn b() -> i32 {\n    20\n}",
+    )
+    .unwrap();
+
+    // Compose r0, r1, r2 into a single multi-file DiffSet r4 via UNION
+    let r3 = op_set_algebra(&store, None, SetOp::Union, &r0.name, &r1.name).unwrap();
+    let r4 = op_set_algebra(&store, None, SetOp::Union, &r3.name, &r2.name).unwrap();
+    assert_eq!(r4.value.len(), 2, "Expected 2 file patches in composed DiffSet");
+
+    // 1. Run VERIFY on r4 with a failing check -> both extra.rs and lib.rs must roll back!
+    let r5_fail = op_verify(
+        &store,
+        None,
+        &r4.name,
+        &["sh".to_string(), "-c".to_string(), "exit 1".to_string()],
+    )
+    .unwrap();
+    assert_eq!(r5_fail.opcode, "VERIFY_ROLLBACK");
+    assert!(!new_mod.exists(), "extra.rs must be unlinked on rollback");
+    assert_eq!(fs::read_to_string(&lib_file).unwrap(), initial_lib);
+
+    // 2. Run VERIFY on r4 with a passing check -> both files are atomically updated!
+    let r6_ok = op_verify(
+        &store,
+        None,
+        &r4.name,
+        &[
+            "sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "test -f '{}' && grep -q '10' '{}' && grep -q '20' '{}'",
+                new_mod.display(),
+                lib_file.display(),
+                lib_file.display()
+            ),
+        ],
+    )
+    .unwrap();
+    assert_eq!(r6_ok.opcode, "VERIFY_OK");
+    assert!(new_mod.exists());
+    let updated_lib = fs::read_to_string(&lib_file).unwrap();
+    assert!(updated_lib.contains("10") && updated_lib.contains("20"));
+}
+
+#[test]
+fn test_git_dirty_schema_and_trace() {
+    use std::process::Command;
+
+    let shm_tmp = tempdir().unwrap();
+    let repo_tmp = tempdir().unwrap();
+    let repo_path = repo_tmp.path();
+
+    // Initialize a temporary git repository
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .arg("init")
+        .output()
+        .unwrap();
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["config", "user.email", "test@example.com"])
+        .output()
+        .unwrap();
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["config", "user.name", "Test"])
+        .output()
+        .unwrap();
+
+    let clean_f = repo_path.join("clean.rs");
+    let dirty_f = repo_path.join("dirty.rs");
+    let untracked_f = repo_path.join("untracked.rs");
+
+    fs::write(&clean_f, "fn clean() {}\n").unwrap();
+    fs::write(&dirty_f, "fn v1() {}\n").unwrap();
+
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["add", "."])
+        .output()
+        .unwrap();
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["commit", "-m", "init"])
+        .output()
+        .unwrap();
+
+    // Modify dirty.rs and create untracked.rs
+    fs::write(&dirty_f, "fn v2() {}\n").unwrap();
+    fs::write(&untracked_f, "fn new_file() {}\n").unwrap();
+
+    let store = ShmStore::open(Some(shm_tmp.path().to_path_buf())).unwrap();
+    let r0 = op_dirty(&store, None, repo_path).unwrap();
+    assert_eq!(r0.opcode, "DIRTY");
+    let paths = r0.value.extract_paths();
+    assert_eq!(paths.len(), 2);
+    assert!(paths[0].ends_with("dirty.rs"));
+    assert!(paths[1].ends_with("untracked.rs"));
+
+    let schema = schema_spec();
+    assert!(schema.contains("program ::= stmt"));
+    assert!(schema.contains("VERIFY <diff_reg>"));
+
+    let trace = trace_lineage(&store).unwrap();
+    assert!(trace.contains("r0   <- DIRTY"));
 }

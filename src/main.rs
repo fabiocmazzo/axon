@@ -1,8 +1,8 @@
 use anyhow::Result;
 use axon::isa::{
-    op_commit, op_filter, op_load_with_context, op_match, op_outline, op_patch, op_purge, op_scan,
-    op_set_algebra, op_slice, op_sub, op_undo, op_verify, op_write, op_xexec, FilterOpts,
-    ScanOpts, SetOp,
+    op_commit, op_dirty, op_edit, op_filter, op_load_with_context, op_match, op_outline, op_patch,
+    op_purge, op_scan, op_set_algebra, op_slice, op_sub, op_undo, op_verify, op_write, op_xexec,
+    schema_spec, trace_lineage, FilterOpts, ScanOpts, SetOp,
 };
 use axon::reg::{RegRef, RegisterRecord};
 use axon::shm::ShmStore;
@@ -54,6 +54,13 @@ enum Commands {
         dirs: bool,
     },
 
+    /// Allocate a PathSet of modified or untracked files in the Git working tree
+    Dirty {
+        /// Repository directory to query
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+
     /// Filter an existing PathSet or MatchSet register into a new SSA register
     Filter {
         /// Source register (e.g. r0, @r0, @last)
@@ -86,7 +93,7 @@ enum Commands {
         end: usize,
     },
 
-    /// Compute set union of two SSA registers into a new register
+    /// Compute set union (or compose two DiffSet registers) into a new SSA register
     Union {
         /// First register (e.g. r0)
         reg_a: String,
@@ -162,6 +169,18 @@ enum Commands {
         /// Treat pattern and replacement as literal fixed strings
         #[arg(short = 'F', long)]
         fixed: bool,
+    },
+
+    /// Stage surgical exact-anchor replacement in SSA memory (requires unique occurrence of old_block)
+    Edit {
+        /// Source register (e.g. r0[0]) or file path
+        target: String,
+
+        /// Exact unique text block to locate
+        old_block: String,
+
+        /// New text block to replace it with
+        new_block: String,
     },
 
     /// Stage surgical line-range replacement in SSA memory into a DiffSet register without touching disk
@@ -247,6 +266,12 @@ enum Commands {
     /// List all allocated SSA registers in shared memory
     Regs,
 
+    /// Reconstruct the chronological SSA lineage graph of registers in /dev/shm
+    Trace,
+
+    /// Emit the compact EBNF ISA specification and system-prompt reference for agents / Tiny LMs
+    Schema,
+
     /// Display shared-memory usage and register statistics in /dev/shm
     Stats,
 
@@ -308,6 +333,10 @@ fn main() -> Result<()> {
                     include_dirs: dirs,
                 },
             )?;
+            print_record(&rec, cli.json)?;
+        }
+        Commands::Dirty { path } => {
+            let rec = op_dirty(&store, None, &path)?;
             print_record(&rec, cli.json)?;
         }
         Commands::Filter {
@@ -375,6 +404,14 @@ fn main() -> Result<()> {
             fixed,
         } => {
             let rec = op_sub(&store, None, &target, &pattern, &replacement, fixed)?;
+            print_record(&rec, cli.json)?;
+        }
+        Commands::Edit {
+            target,
+            old_block,
+            new_block,
+        } => {
+            let rec = op_edit(&store, None, &target, &old_block, &new_block)?;
             print_record(&rec, cli.json)?;
         }
         Commands::Patch {
@@ -458,9 +495,25 @@ fn main() -> Result<()> {
                 for entry in list {
                     println!(
                         "{} = {}({} items) [op: {}, origin: {}]",
-                        entry.name, entry.reg_type, entry.items, entry.opcode, e_origin(&entry.origin)
+                        entry.name, entry.reg_type, entry.items, entry.opcode, entry.origin
                     );
                 }
+            }
+        }
+        Commands::Trace => {
+            let txt = trace_lineage(&store)?;
+            if cli.json {
+                println!("{}", serde_json::json!({ "trace": txt }));
+            } else {
+                print!("{txt}");
+            }
+        }
+        Commands::Schema => {
+            let spec = schema_spec();
+            if cli.json {
+                println!("{}", serde_json::json!({ "schema": spec }));
+            } else {
+                println!("{spec}");
             }
         }
         Commands::Stats => {
@@ -522,8 +575,4 @@ fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-fn e_origin(s: &str) -> &str {
-    s
 }

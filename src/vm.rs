@@ -1,7 +1,7 @@
 use crate::isa::{
-    op_commit, op_filter, op_load_with_context, op_match, op_outline, op_patch, op_purge, op_scan,
-    op_set_algebra, op_slice, op_sub, op_undo, op_verify, op_write, op_xexec, FilterOpts,
-    ScanOpts, SetOp,
+    op_commit, op_dirty, op_edit, op_filter, op_load_with_context, op_match, op_outline, op_patch,
+    op_purge, op_scan, op_set_algebra, op_slice, op_sub, op_undo, op_verify, op_write, op_xexec,
+    schema_spec, trace_lineage, FilterOpts, ScanOpts, SetOp,
 };
 use crate::reg::{RegRef, RegisterRecord};
 use crate::shm::ShmStore;
@@ -147,8 +147,6 @@ fn parse_dest_binding(tokens: &[String]) -> Result<(Option<u32>, &[String])> {
     }
 }
 
-/// Remap a virtual register operand (e.g. `r0`, `@r0`, `r0[1]`) to its physical `/dev/shm` SSA register
-/// if `r0` was bound and renamed earlier in the current VM execution.
 fn remap_operand(operand: &str, local_bindings: &BTreeMap<u32, u32>) -> String {
     if !RegRef::looks_like_reg(operand) {
         return operand.to_string();
@@ -278,6 +276,14 @@ pub fn execute_program(store: &ShmStore, script_or_path: &str) -> Result<Vec<VmS
                 let rec = op_scan(store, phys_target, &opts)?;
                 record_step(stmt, virtual_id, rec, &mut local_bindings)
             }
+            "DIRTY" => {
+                let root = args
+                    .first()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("."));
+                let rec = op_dirty(store, phys_target, &root)?;
+                record_step(stmt, virtual_id, rec, &mut local_bindings)
+            }
             "FILTER" => {
                 if args.is_empty() {
                     bail!("FILTER requires a source register");
@@ -343,12 +349,12 @@ pub fn execute_program(store: &ShmStore, script_or_path: &str) -> Result<Vec<VmS
                 let rec = op_slice(store, phys_target, &src_reg, start, end)?;
                 record_step(stmt, virtual_id, rec, &mut local_bindings)
             }
-            "UNION" | "INTERSECT" | "DIFF" => {
+            "UNION" | "MERGE" | "INTERSECT" | "DIFF" => {
                 if args.len() != 2 {
                     bail!("{op} requires <reg_a> <reg_b>");
                 }
                 let set_op = match op.as_str() {
-                    "UNION" => SetOp::Union,
+                    "UNION" | "MERGE" => SetOp::Union,
                     "INTERSECT" => SetOp::Intersect,
                     _ => SetOp::Diff,
                 };
@@ -431,6 +437,14 @@ pub fn execute_program(store: &ShmStore, script_or_path: &str) -> Result<Vec<VmS
                 let replacement = &args[2];
                 let fixed = args[3..].iter().any(|a| a == "--fixed" || a == "-F");
                 let rec = op_sub(store, phys_target, &target, pattern, replacement, fixed)?;
+                record_step(stmt, virtual_id, rec, &mut local_bindings)
+            }
+            "EDIT" => {
+                if args.len() != 3 {
+                    bail!("EDIT requires <reg_or_path> <old_unique_block> <new_block>");
+                }
+                let target = remap_operand(&args[0], &local_bindings);
+                let rec = op_edit(store, phys_target, &target, &args[1], &args[2])?;
                 record_step(stmt, virtual_id, rec, &mut local_bindings)
             }
             "PATCH" => {
@@ -593,6 +607,21 @@ pub fn execute_program(store: &ShmStore, script_or_path: &str) -> Result<Vec<VmS
                     text_output: Some(lines.join("\n")),
                 }
             }
+            "TRACE" => {
+                let txt = trace_lineage(store)?;
+                VmStepOutput {
+                    instruction: stmt,
+                    virtual_reg: None,
+                    register: None,
+                    text_output: Some(txt),
+                }
+            }
+            "SCHEMA" => VmStepOutput {
+                instruction: stmt,
+                virtual_reg: None,
+                register: None,
+                text_output: Some(schema_spec()),
+            },
             "STATS" => {
                 let st = store.stats()?;
                 let text = format!(

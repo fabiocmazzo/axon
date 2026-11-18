@@ -230,6 +230,70 @@ pub fn op_scan(
     store.allocate(explicit_id, "SCAN", origin, RegValue::PathSet(entries))
 }
 
+/// `DIRTY`: Queries `git status --porcelain -uall` to allocate a `PathSet` of modified/untracked working-tree files.
+pub fn op_dirty(
+    store: &ShmStore,
+    explicit_id: Option<u32>,
+    root: &Path,
+) -> Result<RegisterRecord> {
+    if !root.exists() {
+        bail!("DIRTY root '{}' does not exist", root.display());
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain", "-uall"])
+        .output()
+        .context("DIRTY failed to execute 'git status --porcelain'")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("DIRTY git status failed: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut entries = Vec::new();
+
+    for line in stdout.lines() {
+        if line.len() < 4 {
+            continue;
+        }
+        let raw_path = line[3..].trim();
+        let effective_rel = if let Some((_, renamed_to)) = raw_path.split_once(" -> ") {
+            renamed_to.trim().trim_matches('"')
+        } else {
+            raw_path.trim_matches('"')
+        };
+
+        let joined = if root == Path::new(".") {
+            PathBuf::from(effective_rel)
+        } else {
+            root.join(effective_rel)
+        };
+
+        if let Ok(meta) = fs::metadata(&joined) {
+            if meta.is_file() {
+                entries.push(PathEntry {
+                    path: normalize_display_path(&joined),
+                    size: meta.len(),
+                    is_dir: false,
+                });
+            }
+        }
+    }
+
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    entries.dedup_by(|a, b| a.path == b.path);
+
+    store.allocate(
+        explicit_id,
+        "DIRTY",
+        normalize_display_path(root),
+        RegValue::PathSet(entries),
+    )
+}
+
 /// `FILTER`: Deterministic subset selection on `PathSet` or `MatchSet`.
 pub fn op_filter(
     store: &ShmStore,
@@ -306,7 +370,7 @@ pub fn op_filter(
     store.allocate(explicit_id, "FILTER", src.name, filtered_val)
 }
 
-/// `SLICE`:Deterministic pagination of any register (`[start..end)`) into a new SSA register.
+/// `SLICE`: Deterministic pagination of any register (`[start..end)`) into a new SSA register.
 pub fn op_slice(
     store: &ShmStore,
     explicit_id: Option<u32>,
@@ -325,7 +389,77 @@ pub fn op_slice(
     )
 }
 
-/// `UNION` / `INTERSECT` / `DIFF`: SSA register set algebra.
+/// Compose two `FilePatch` structs targeting the exact same file path.
+fn compose_same_file_patches(a: &FilePatch, b: &FilePatch) -> Result<FilePatch> {
+    // Case 1: b was staged directly on top of a's output
+    if b.base_hash == a.modified_hash && !b.created_new {
+        return Ok(FilePatch {
+            path: a.path.clone(),
+            replacements: a.replacements + b.replacements,
+            base_hash: a.base_hash,
+            modified_hash: b.modified_hash,
+            original: a.original.clone(),
+            modified: b.modified.clone(),
+            created_new: a.created_new,
+        });
+    }
+
+    // Case 2: Both a and b were staged independently against the same base file on disk
+    if !a.created_new && !b.created_new && a.base_hash == b.base_hash && a.original == b.original {
+        // Isolate the changed span in b relative to original
+        let orig_bytes = b.original.as_bytes();
+        let mod_b_bytes = b.modified.as_bytes();
+        let mut prefix = 0;
+        while prefix < orig_bytes.len()
+            && prefix < mod_b_bytes.len()
+            && orig_bytes[prefix] == mod_b_bytes[prefix]
+        {
+            prefix += 1;
+        }
+        let mut orig_end = orig_bytes.len();
+        let mut mod_b_end = mod_b_bytes.len();
+        while orig_end > prefix
+            && mod_b_end > prefix
+            && orig_bytes[orig_end - 1] == mod_b_bytes[mod_b_end - 1]
+        {
+            orig_end -= 1;
+            mod_b_end -= 1;
+        }
+
+        // Expand to line boundaries so anchor matching inside a.modified is context-safe
+        let line_start = b.original[..prefix]
+            .rfind('\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        let orig_line_end = b.original[orig_end..]
+            .find('\n')
+            .map(|idx| orig_end + idx + 1)
+            .unwrap_or(b.original.len());
+        let delta_len = b.modified.len() as isize - b.original.len() as isize;
+        let mod_b_line_end = ((orig_line_end as isize) + delta_len) as usize;
+
+        if line_start <= orig_line_end && line_start <= mod_b_line_end && mod_b_line_end <= b.modified.len() {
+            let old_span = &b.original[line_start..orig_line_end];
+            let new_span = &b.modified[line_start..mod_b_line_end];
+            if !old_span.is_empty() && a.modified.matches(old_span).count() == 1 {
+                let composed_mod = a.modified.replacen(old_span, new_span, 1);
+                return Ok(FilePatch::new(
+                    a.path.clone(),
+                    a.replacements + b.replacements,
+                    a.original.clone(),
+                    composed_mod,
+                ));
+            }
+        }
+    }
+
+    bail!(
+        "DIFF_MERGE_CONFLICT: cannot compose overlapping or incompatible patches for file '{}'",
+        a.path
+    )
+}
+
+/// `UNION` / `INTERSECT` / `DIFF`: SSA register set algebra (including `DiffSet` composition on `UNION`).
 pub fn op_set_algebra(
     store: &ShmStore,
     explicit_id: Option<u32>,
@@ -338,6 +472,45 @@ pub fn op_set_algebra(
     let origin = format!("{} {} {}", rec_a.name, op.opcode_name(), rec_b.name);
 
     let result_val = match (&rec_a.value, &rec_b.value) {
+        (RegValue::DiffSet(patches_a), RegValue::DiffSet(patches_b)) => {
+            match op {
+                SetOp::Union => {
+                    let mut merged: BTreeMap<String, FilePatch> = BTreeMap::new();
+                    for p in patches_a {
+                        merged.insert(p.path.clone(), p.clone());
+                    }
+                    for p in patches_b {
+                        if let Some(existing) = merged.get(&p.path) {
+                            let composed = compose_same_file_patches(existing, p)?;
+                            merged.insert(p.path.clone(), composed);
+                        } else {
+                            merged.insert(p.path.clone(), p.clone());
+                        }
+                    }
+                    RegValue::DiffSet(merged.into_values().collect())
+                }
+                SetOp::Diff => {
+                    let b_paths: BTreeSet<&str> =
+                        patches_b.iter().map(|p| p.path.as_str()).collect();
+                    let kept = patches_a
+                        .iter()
+                        .filter(|p| !b_paths.contains(p.path.as_str()))
+                        .cloned()
+                        .collect();
+                    RegValue::DiffSet(kept)
+                }
+                SetOp::Intersect => {
+                    let b_paths: BTreeSet<&str> =
+                        patches_b.iter().map(|p| p.path.as_str()).collect();
+                    let kept = patches_a
+                        .iter()
+                        .filter(|p| b_paths.contains(p.path.as_str()))
+                        .cloned()
+                        .collect();
+                    RegValue::DiffSet(kept)
+                }
+            }
+        }
         (RegValue::PathSet(items_a), RegValue::PathSet(items_b)) => {
             let map_b: BTreeMap<&str, &PathEntry> =
                 items_b.iter().map(|e| (e.path.as_str(), e)).collect();
@@ -472,7 +645,7 @@ pub fn op_set_algebra(
             RegValue::MatchSet(out)
         }
         (other_a, other_b) => bail!(
-            "{} is supported on PathSet or MatchSet registers, got {} and {}",
+            "{} is supported on PathSet, MatchSet, or DiffSet registers, got {} and {}",
             op.opcode_name(),
             other_a.type_name(),
             other_b.type_name()
@@ -761,6 +934,72 @@ pub fn op_sub(
     )
 }
 
+/// `EDIT`: Unique-anchor exact block replacement producing a `DiffSet` register.
+/// Fails with `ANCHOR_NOT_FOUND` if `<old_block>` is absent, or `AMBIGUOUS_ANCHOR` (with line numbers)
+/// if `<old_block>` appears more than once in a target file.
+pub fn op_edit(
+    store: &ShmStore,
+    explicit_id: Option<u32>,
+    target: &str,
+    old_block: &str,
+    new_block: &str,
+) -> Result<RegisterRecord> {
+    if old_block.is_empty() {
+        bail!("EDIT old_block anchor cannot be empty");
+    }
+
+    let (origin_name, files) = resolve_source_files(store, target)?;
+    let mut patches = Vec::new();
+
+    for file_path in &files {
+        let original = match fs::read_to_string(file_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let match_offsets: Vec<usize> = original
+            .match_indices(old_block)
+            .map(|(idx, _)| idx)
+            .collect();
+
+        if match_offsets.is_empty() {
+            continue;
+        }
+
+        if match_offsets.len() > 1 {
+            let line_numbers: Vec<usize> = match_offsets
+                .iter()
+                .map(|&byte_idx| original[..byte_idx].bytes().filter(|&b| b == b'\n').count() + 1)
+                .collect();
+            bail!(
+                "AMBIGUOUS_ANCHOR: anchor matched {} times in '{}' at lines {:?}; include more surrounding lines to make it unique",
+                match_offsets.len(),
+                file_path,
+                line_numbers
+            );
+        }
+
+        let modified = original.replacen(old_block, new_block, 1);
+        if modified != original {
+            patches.push(FilePatch::new(file_path.clone(), 1, original, modified));
+        }
+    }
+
+    if patches.is_empty() {
+        bail!(
+            "ANCHOR_NOT_FOUND: exact anchor block was not found in {}",
+            origin_name
+        );
+    }
+
+    store.allocate(
+        explicit_id,
+        "EDIT",
+        origin_name,
+        RegValue::DiffSet(patches),
+    )
+}
+
 /// `PATCH`: Pure SSA line-range surgical replacement producing a `DiffSet` register without mutating disk.
 pub fn op_patch(
     store: &ShmStore,
@@ -846,7 +1085,6 @@ pub fn op_write(
 }
 
 fn verify_cas_and_apply_patches(diff_name: &str, patches: &[FilePatch]) -> Result<Vec<String>> {
-    // Phase 1: Pre-flight Compare-And-Swap (CAS) verification across all target files
     for patch in patches {
         let p = Path::new(&patch.path);
         if patch.created_new {
@@ -877,7 +1115,6 @@ fn verify_cas_and_apply_patches(diff_name: &str, patches: &[FilePatch]) -> Resul
         }
     }
 
-    // Phase 2: Atomic write-and-rename
     let mut committed_paths = Vec::with_capacity(patches.len());
     for patch in patches {
         write_file_atomic_preserving_perms(
@@ -1022,10 +1259,8 @@ pub fn op_verify(
         ),
     };
 
-    // Step 1: Apply DiffSet to disk with CAS verification
     let _committed = verify_cas_and_apply_patches(&rec.name, &patches)?;
 
-    // Step 2: Run verification command
     let prog = &cmd_parts[0];
     let args = &cmd_parts[1..];
     let cmd_str = cmd_parts.join(" ");
@@ -1051,7 +1286,6 @@ pub fn op_verify(
                     RegValue::ExecResult(vec![receipt]),
                 )
             } else {
-                // Step 3: Verification failed -> automatically roll back changes on disk!
                 let _ = revert_patches_to_disk(&patches, true);
                 let receipt = CmdReceipt {
                     command: cmd_str.clone(),
@@ -1181,4 +1415,68 @@ pub fn op_xexec(
         format!("{} ({})", rec.name, cmd_parts.join(" ")),
         RegValue::ExecResult(receipts),
     )
+}
+
+/// `SCHEMA`: Returns a compact, token-efficient EBNF ISA specification ready for LLM / Tiny-LM system prompts.
+pub fn schema_spec() -> String {
+    r#"# AXON (`ax`) — Shared-Memory SSA Register VM & Agent ISA
+program ::= stmt (";" | "\n" stmt)*
+stmt    ::= (reg "=")? op
+reg     ::= "r" DIGIT+ | "@r" DIGIT+ | "@last" | reg "[" DIGIT+ "]"
+
+## Register Types (/dev/shm/axon-<uid>)
+- PathSet    : Deterministic sorted file paths + byte sizes
+- MatchSet   : File/line/col regex or symbol matches
+- TextBuf    : Line-numbered file slices or merged ±N context windows
+- DiffSet    : Staged in-memory patches with 64-bit FNV-1a CAS hashes & Unified Diff
+- ExecResult : Structured command receipts (exit_code, stdout, stderr)
+- Tombstone  : Audit receipt of COMMIT, UNDO, or PURGE paths
+
+## Orthogonal Opcodes (`ax run "<program>"` or `ax <subcommand>`)
+- SCAN [path] [glob] [--max-depth N] [--hidden]      -> PathSet
+- DIRTY [path]                                       -> PathSet (git modified/untracked)
+- FILTER <reg> [--glob G] [--regex R] [--max-size B] -> PathSet | MatchSet
+- SLICE <reg> <start> <end>                          -> Same type [start..end)
+- UNION | INTERSECT | DIFF <regA> <regB>             -> PathSet | MatchSet | DiffSet
+- MATCH <reg|path> <pattern> [--fixed]               -> MatchSet
+- OUTLINE [reg|path]                                 -> MatchSet (fn/struct/enum/impl/def)
+- LOAD <reg|path> [-s A] [-e B] [--context N]        -> TextBuf
+- EDIT <reg|path> <old_unique_block> <new_block>     -> DiffSet (exact unique anchor)
+- PATCH <reg|path> -s <A> -e <B> -w <replacement>    -> DiffSet (1-based lines A..=B)
+- SUB <reg|path> <pattern> <replacement> [--fixed]   -> DiffSet
+- WRITE <file_path> <content>                        -> DiffSet (create/overwrite)
+- COMMIT <diff_reg>                                  -> Tombstone (CAS-checked atomic write)
+- VERIFY <diff_reg> <cmd> [args...]                  -> ExecResult (COMMIT + test + auto-UNDO on fail)
+- UNDO [commit_or_diff_reg] [--force]                -> Tombstone (atomic rollback)
+- PURGE <pathset_reg> [--force]                      -> Tombstone
+- XEXEC <reg> <cmd> [args...]                        -> ExecResult
+- INSPECT [reg] [--limit N] [--max-chars M]          -> Formatted payload
+- REGS | STATS | TRACE | GC [keep_N] | RESET         -> Control & telemetry
+"#
+    .trim()
+    .to_string()
+}
+
+/// `TRACE`: Reconstructs the chronological SSA lineage graph of registers in `/dev/shm`.
+pub fn trace_lineage(store: &ShmStore) -> Result<String> {
+    let entries = store.list()?;
+    if entries.is_empty() {
+        return Ok(format!(
+            "No SSA lineage in {} (0 registers)",
+            store.root().display()
+        ));
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# Axon SSA Lineage Trace ({})\n",
+        store.root().display()
+    ));
+    for e in entries {
+        out.push_str(&format!(
+            "{:<4} <- {:<15} {:<10} ({:>3} items) | origin: {}\n",
+            e.name, e.opcode, e.reg_type, e.items, e.origin
+        ));
+    }
+    Ok(out)
 }
