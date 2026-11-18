@@ -368,7 +368,19 @@ fn main() -> Result<()> {
             } else {
                 for step in steps {
                     if let Some(rec) = step.register {
-                        println!("{}", rec.summary_line());
+                        if let Some(v_reg) = step.virtual_reg {
+                            println!(
+                                "{} (local {}) = {}({} items) [op: {}, origin: {}]",
+                                rec.name,
+                                v_reg,
+                                rec.value.type_name(),
+                                rec.value.len(),
+                                rec.opcode,
+                                rec.origin
+                            );
+                        } else {
+                            println!("{}", rec.summary_line());
+                        }
                     }
                     if let Some(txt) = step.text_output {
                         if !txt.ends_with('\n') {

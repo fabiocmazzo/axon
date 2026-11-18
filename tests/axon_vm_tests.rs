@@ -407,3 +407,49 @@ fn test_ssa_set_algebra_and_outline() {
     assert_eq!(r5.opcode, "OUTLINE");
     assert_eq!(r5.value.len(), 2);
 }
+
+#[test]
+fn test_vm_virtual_ssa_renaming_across_runs_and_intra_run_ssa_violation() {
+    let shm_tmp = tempdir().unwrap();
+    let work_tmp = tempdir().unwrap();
+
+    fs::write(work_tmp.path().join("one.rs"), "pub fn first() {}\n").unwrap();
+    let store = ShmStore::open(Some(shm_tmp.path().to_path_buf())).unwrap();
+    let root_str = work_tmp.path().to_string_lossy();
+
+    let script = format!(
+        r#"
+        r0 = SCAN "{root_str}" "*.rs"
+        r1 = OUTLINE r0
+        INSPECT r1
+        "#
+    );
+
+    // Run 1: binds physical r0 and r1
+    let run1 = execute_program(&store, &script).unwrap();
+    assert_eq!(run1[0].register.as_ref().unwrap().name, "r0");
+    assert_eq!(run1[0].virtual_reg, None);
+    assert_eq!(run1[1].register.as_ref().unwrap().name, "r1");
+    assert_eq!(run1[1].virtual_reg, None);
+
+    // Run 2 (identical script with r0 and r1): automatically renames virtual r0 -> r2, r1 -> r3
+    let run2 = execute_program(&store, &script).unwrap();
+    assert_eq!(run2[0].register.as_ref().unwrap().name, "r2");
+    assert_eq!(run2[0].virtual_reg.as_deref(), Some("r0"));
+    assert_eq!(run2[1].register.as_ref().unwrap().name, "r3");
+    assert_eq!(run2[1].virtual_reg.as_deref(), Some("r1"));
+    assert_eq!(run2[1].register.as_ref().unwrap().origin, "r2");
+
+    // Intra-run duplicate assignment (`r0 = ...; r0 = ...` in the SAME script) must still fail with SSA_VIOLATION
+    let bad_script = format!(
+        r#"
+        r0 = SCAN "{root_str}" "*.rs"
+        r0 = OUTLINE r0
+        "#
+    );
+    let err = execute_program(&store, &bad_script).unwrap_err();
+    assert!(
+        err.to_string().contains("SSA_VIOLATION"),
+        "Expected intra-script SSA_VIOLATION, got: {err}"
+    );
+}

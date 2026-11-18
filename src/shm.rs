@@ -92,6 +92,13 @@ impl ShmStore {
         &self.root
     }
 
+    /// Check whether a physical SSA register ID is already allocated in shared memory.
+    pub fn is_allocated(&self, id: u32) -> Result<bool> {
+        let _guard = self.lock()?;
+        let manifest = self.read_manifest_unlocked()?;
+        Ok(manifest.allocated_ids.contains(&id) || self.reg_path(id).exists())
+    }
+
     fn lock(&self) -> Result<FlockGuard> {
         FlockGuard::acquire(&self.root.join(".axon.lock"))
     }

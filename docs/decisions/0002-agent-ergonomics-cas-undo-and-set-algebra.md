@@ -26,3 +26,5 @@ We extended the Axon ISA with four orthogonal capabilities while preserving the 
    - Operates directly on SSA registers in shared memory, allowing e.g. `DIFF <PathSet> <MatchSet>` to filter out files that matched a pattern without re-scanning the filesystem.
 4. **Structural Symbol Extraction (`OUTLINE`)**:
    - Extracts top-level declarations (`fn`, `struct`, `enum`, `trait`, `impl`, `mod`, `type`, `class`, `def`, `interface`, `func`, markdown headings) into a `MatchSet`.
+5. **Per-Execution Virtual-to-Physical SSA Register Renaming (`ax run`)**:
+   - Inside `ax run`, destination registers (`r0 = ...`) are validated for strict SSA uniqueness *within* that program execution (`r0 = ...; r0 = ...` in the same run returns `SSA_VIOLATION`), but if physical `r0` is already allocated in `/dev/shm` from an earlier run, `ax run` automatically allocates the next monotonic physical register (`rK`) and remaps all downstream references to `r0` in that execution to `@rK`.
