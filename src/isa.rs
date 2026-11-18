@@ -81,9 +81,22 @@ fn matches_glob(matcher: &GlobMatcher, path_str: &str) -> bool {
 }
 
 /// Write bytes atomically to a target file via a sibling temporary file in the same directory.
-fn write_file_atomic_preserving_perms(target_path: &Path, content: &[u8], tag: &str) -> Result<()> {
+fn write_file_atomic_preserving_perms(
+    target_path: &Path,
+    content: &[u8],
+    tag: &str,
+) -> Result<()> {
     let pid = unsafe { libc::getpid() };
     let parent = target_path.parent().unwrap_or_else(|| Path::new("."));
+    if !parent.as_os_str().is_empty() && !parent.exists() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create parent directory {} for {}",
+                parent.display(),
+                target_path.display()
+            )
+        })?;
+    }
     let file_name = target_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -291,6 +304,25 @@ pub fn op_filter(
     };
 
     store.allocate(explicit_id, "FILTER", src.name, filtered_val)
+}
+
+/// `SLICE`:Deterministic pagination of any register (`[start..end)`) into a new SSA register.
+pub fn op_slice(
+    store: &ShmStore,
+    explicit_id: Option<u32>,
+    source_reg: &str,
+    start: usize,
+    end: usize,
+) -> Result<RegisterRecord> {
+    let reg_ref = RegRef::parse(source_reg)?;
+    let src = store.resolve(&reg_ref)?;
+    let sliced = src.value.slice_range(start, end)?;
+    store.allocate(
+        explicit_id,
+        "SLICE",
+        format!("{}[{start}..{end}]", src.name),
+        sliced,
+    )
 }
 
 /// `UNION` / `INTERSECT` / `DIFF`: SSA register set algebra.
@@ -584,8 +616,6 @@ pub fn op_load_with_context(
     end_line: Option<usize>,
     context: Option<usize>,
 ) -> Result<RegisterRecord> {
-    // If target is a MatchSet and context is requested (and no explicit start/end override),
-    // load merged ±context windows around each match!
     if let Some(ctx) = context {
         if start_line.is_none() && end_line.is_none() && RegRef::looks_like_reg(target) {
             let reg_ref = RegRef::parse(target)?;
@@ -613,7 +643,6 @@ pub fn op_load_with_context(
                     match_lines.sort_unstable();
                     match_lines.dedup();
 
-                    // Build and merge overlapping or adjacent [start..=end] windows
                     let mut windows: Vec<(usize, usize)> = Vec::new();
                     for line_no in match_lines {
                         let w_start = line_no.saturating_sub(ctx).max(1).min(total);
@@ -787,6 +816,115 @@ pub fn op_patch(
     )
 }
 
+/// `WRITE`: Pure SSA staging of a new file creation (or full file replacement) into a `DiffSet` register.
+pub fn op_write(
+    store: &ShmStore,
+    explicit_id: Option<u32>,
+    target_path: &str,
+    content: &str,
+) -> Result<RegisterRecord> {
+    let norm_path = normalize_display_path(Path::new(target_path));
+    let mut normalized_content = content.to_string();
+    if !normalized_content.is_empty() && !normalized_content.ends_with('\n') {
+        normalized_content.push('\n');
+    }
+
+    let patch = if Path::new(&norm_path).exists() {
+        let original = fs::read_to_string(&norm_path)
+            .with_context(|| format!("WRITE failed to read existing file '{norm_path}'"))?;
+        FilePatch::new(norm_path.clone(), 1, original, normalized_content)
+    } else {
+        FilePatch::new_created(norm_path.clone(), normalized_content)
+    };
+
+    store.allocate(
+        explicit_id,
+        "WRITE",
+        norm_path,
+        RegValue::DiffSet(vec![patch]),
+    )
+}
+
+fn verify_cas_and_apply_patches(diff_name: &str, patches: &[FilePatch]) -> Result<Vec<String>> {
+    // Phase 1: Pre-flight Compare-And-Swap (CAS) verification across all target files
+    for patch in patches {
+        let p = Path::new(&patch.path);
+        if patch.created_new {
+            if p.exists() {
+                bail!(
+                    "CAS_CONFLICT: file '{}' already exists on disk, but {} staged it as a newly created file",
+                    patch.path,
+                    diff_name
+                );
+            }
+        } else {
+            let current_bytes = fs::read(p).with_context(|| {
+                format!(
+                    "CAS_CONFLICT: failed to read '{}' before COMMIT",
+                    patch.path
+                )
+            })?;
+            let current_hash = fnv1a_64(&current_bytes);
+            if current_hash != patch.base_hash {
+                bail!(
+                    "CAS_CONFLICT: file '{}' was modified on disk since {} was staged (expected hash {:016x}, found {:016x})",
+                    patch.path,
+                    diff_name,
+                    patch.base_hash,
+                    current_hash
+                );
+            }
+        }
+    }
+
+    // Phase 2: Atomic write-and-rename
+    let mut committed_paths = Vec::with_capacity(patches.len());
+    for patch in patches {
+        write_file_atomic_preserving_perms(
+            Path::new(&patch.path),
+            patch.modified.as_bytes(),
+            "axon-commit",
+        )?;
+        committed_paths.push(patch.path.clone());
+    }
+    Ok(committed_paths)
+}
+
+fn revert_patches_to_disk(patches: &[FilePatch], force: bool) -> Result<Vec<String>> {
+    if !force {
+        for patch in patches {
+            let current_bytes = fs::read(&patch.path).with_context(|| {
+                format!("CAS_CONFLICT: failed to read '{}' before UNDO", patch.path)
+            })?;
+            let current_hash = fnv1a_64(&current_bytes);
+            if current_hash != patch.modified_hash {
+                bail!(
+                    "CAS_CONFLICT: file '{}' was modified after COMMIT (expected hash {:016x}, found {:016x}); pass --force to override",
+                    patch.path,
+                    patch.modified_hash,
+                    current_hash
+                );
+            }
+        }
+    }
+
+    let mut restored_paths = Vec::with_capacity(patches.len());
+    for patch in patches {
+        let p = Path::new(&patch.path);
+        if patch.created_new {
+            if p.exists() {
+                fs::remove_file(p).with_context(|| {
+                    format!("UNDO failed to remove created file '{}'", patch.path)
+                })?;
+            }
+        } else {
+            write_file_atomic_preserving_perms(p, patch.original.as_bytes(), "axon-undo")?;
+        }
+        restored_paths.push(patch.path.clone());
+    }
+    Ok(restored_paths)
+}
+
 /// `COMMIT`: Verifies CAS base hashes on disk, then atomically writes all staged patches in a `DiffSet` register.
 pub fn op_commit(
     store: &ShmStore,
@@ -805,36 +943,7 @@ pub fn op_commit(
         ),
     };
 
-    // Phase 1: Pre-flight Compare-And-Swap (CAS) verification across all target files
-    for patch in &patches {
-        let current_bytes = fs::read(&patch.path).with_context(|| {
-            format!(
-                "CAS_CONFLICT: failed to read '{}' before COMMIT",
-                patch.path
-            )
-        })?;
-        let current_hash = fnv1a_64(&current_bytes);
-        if current_hash != patch.base_hash {
-            bail!(
-                "CAS_CONFLICT: file '{}' was modified on disk since {} was staged (expected hash {:016x}, found {:016x})",
-                patch.path,
-                rec.name,
-                patch.base_hash,
-                current_hash
-            );
-        }
-    }
-
-    // Phase 2: Atomic write-and-rename
-    let mut committed_paths = Vec::with_capacity(patches.len());
-    for patch in &patches {
-        write_file_atomic_preserving_perms(
-            Path::new(&patch.path),
-            patch.modified.as_bytes(),
-            "axon-commit",
-        )?;
-        committed_paths.push(patch.path.clone());
-    }
+    let committed_paths = verify_cas_and_apply_patches(&rec.name, &patches)?;
 
     store.allocate(
         explicit_id,
@@ -854,7 +963,6 @@ pub fn op_undo(
     let reg_ref = RegRef::parse(target_reg)?;
     let rec = store.resolve(&reg_ref)?;
 
-    // Resolve the underlying DiffSet whether the user passed the COMMIT register or the DiffSet register directly
     let (diff_name, patches) = match rec.value {
         RegValue::DiffSet(p) => (rec.name, p),
         RegValue::Tombstone(_) if rec.opcode == "COMMIT" => {
@@ -882,32 +990,7 @@ pub fn op_undo(
         ),
     };
 
-    if !force {
-        for patch in &patches {
-            let current_bytes = fs::read(&patch.path).with_context(|| {
-                format!("CAS_CONFLICT: failed to read '{}' before UNDO", patch.path)
-            })?;
-            let current_hash = fnv1a_64(&current_bytes);
-            if current_hash != patch.modified_hash {
-                bail!(
-                    "CAS_CONFLICT: file '{}' was modified after COMMIT (expected hash {:016x}, found {:016x}); pass --force to override",
-                    patch.path,
-                    patch.modified_hash,
-                    current_hash
-                );
-            }
-        }
-    }
-
-    let mut restored_paths = Vec::with_capacity(patches.len());
-    for patch in &patches {
-        write_file_atomic_preserving_perms(
-            Path::new(&patch.path),
-            patch.original.as_bytes(),
-            "axon-undo",
-        )?;
-        restored_paths.push(patch.path.clone());
-    }
+    let restored_paths = revert_patches_to_disk(&patches, force)?;
 
     store.allocate(
         explicit_id,
@@ -915,6 +998,86 @@ pub fn op_undo(
         diff_name,
         RegValue::Tombstone(restored_paths),
     )
+}
+
+/// `VERIFY`: Transactional `COMMIT -> Run Verification Command -> Auto-UNDO on Non-Zero Exit`.
+pub fn op_verify(
+    store: &ShmStore,
+    explicit_id: Option<u32>,
+    diff_reg: &str,
+    cmd_parts: &[String],
+) -> Result<RegisterRecord> {
+    if cmd_parts.is_empty() {
+        bail!("VERIFY requires a verification command (e.g. VERIFY r2 cargo check)");
+    }
+
+    let reg_ref = RegRef::parse(diff_reg)?;
+    let rec = store.resolve(&reg_ref)?;
+    let patches = match rec.value {
+        RegValue::DiffSet(p) => p,
+        other => bail!(
+            "VERIFY requires a DiffSet register, but {} is {}",
+            rec.name,
+            other.type_name()
+        ),
+    };
+
+    // Step 1: Apply DiffSet to disk with CAS verification
+    let _committed = verify_cas_and_apply_patches(&rec.name, &patches)?;
+
+    // Step 2: Run verification command
+    let prog = &cmd_parts[0];
+    let args = &cmd_parts[1..];
+    let cmd_str = cmd_parts.join(" ");
+
+    match Command::new(prog).args(args).output() {
+        Ok(output) => {
+            let exit_code = output.status.code().unwrap_or(-1);
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+            if exit_code == 0 {
+                let receipt = CmdReceipt {
+                    command: cmd_str.clone(),
+                    target: Some(format!("{} (committed: true)", rec.name)),
+                    exit_code,
+                    stdout,
+                    stderr,
+                };
+                store.allocate(
+                    explicit_id,
+                    "VERIFY_OK",
+                    format!("{} ({cmd_str})", rec.name),
+                    RegValue::ExecResult(vec![receipt]),
+                )
+            } else {
+                // Step 3: Verification failed -> automatically roll back changes on disk!
+                let _ = revert_patches_to_disk(&patches, true);
+                let receipt = CmdReceipt {
+                    command: cmd_str.clone(),
+                    target: Some(format!("{} (rolled_back: true)", rec.name)),
+                    exit_code,
+                    stdout,
+                    stderr,
+                };
+                store.allocate(
+                    explicit_id,
+                    "VERIFY_ROLLBACK",
+                    format!("{} ({cmd_str})", rec.name),
+                    RegValue::ExecResult(vec![receipt]),
+                )
+            }
+        }
+        Err(spawn_err) => {
+            let _ = revert_patches_to_disk(&patches, true);
+            Err(spawn_err).with_context(|| {
+                format!(
+                    "VERIFY failed to spawn '{prog}' (changes from {} were rolled back)",
+                    rec.name
+                )
+            })
+        }
+    }
 }
 
 /// `PURGE`: Deletes files referenced by a `PathSet` register when `force` is true (or dry-run lists targets).

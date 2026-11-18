@@ -1,6 +1,7 @@
 use crate::reg::{RegRef, RegValue, RegisterRecord};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -23,6 +24,23 @@ pub struct RegTableEntry {
     pub opcode: String,
     pub origin: String,
     pub created_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShmStats {
+    pub shm_dir: String,
+    pub total_registers: usize,
+    pub total_bytes: u64,
+    pub next_id: u32,
+    pub by_type: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcReport {
+    pub removed_registers: usize,
+    pub freed_bytes: u64,
+    pub retained_registers: usize,
+    pub next_id: u32,
 }
 
 /// Shared-memory SSA Register Store backed by `/dev/shm`.
@@ -92,11 +110,20 @@ impl ShmStore {
         &self.root
     }
 
-    /// Check whether a physical SSA register ID is already allocated in shared memory.
+    /// Check whether a physical SSA register ID is currently present in shared memory.
     pub fn is_allocated(&self, id: u32) -> Result<bool> {
         let _guard = self.lock()?;
         let manifest = self.read_manifest_unlocked()?;
         Ok(manifest.allocated_ids.contains(&id) || self.reg_path(id).exists())
+    }
+
+    /// Check whether an SSA register ID has already been allocated in this session (including IDs retired by GC).
+    pub fn is_used_or_retired(&self, id: u32) -> Result<bool> {
+        let _guard = self.lock()?;
+        let manifest = self.read_manifest_unlocked()?;
+        Ok(id < manifest.next_id
+            || manifest.allocated_ids.contains(&id)
+            || self.reg_path(id).exists())
     }
 
     fn lock(&self) -> Result<FlockGuard> {
@@ -211,7 +238,6 @@ impl ShmStore {
     }
 
     /// Read a register by reference (`r0`, `@r0`, `@last`, `r0[1]`, etc.).
-    /// If an index is specified (e.g. `r0[2]`), returns a projected `RegisterRecord` containing only that element.
     pub fn resolve(&self, reg_ref: &RegRef) -> Result<RegisterRecord> {
         let _guard = self.lock()?;
         let manifest = self.read_manifest_unlocked()?;
@@ -219,11 +245,9 @@ impl ShmStore {
         let (id, index) = match reg_ref {
             RegRef::Id { id, index } => (*id, *index),
             RegRef::Last { index } => {
-                let last_id = manifest
-                    .allocated_ids
-                    .last()
-                    .copied()
-                    .ok_or_else(|| anyhow!("No registers allocated yet in {}", self.root.display()))?;
+                let last_id = manifest.allocated_ids.last().copied().ok_or_else(|| {
+                    anyhow!("No registers allocated yet in {}", self.root.display())
+                })?;
                 (last_id, *index)
             }
         };
@@ -239,10 +263,7 @@ impl ShmStore {
     fn read_reg_unlocked(&self, id: u32) -> Result<RegisterRecord> {
         let path = self.reg_path(id);
         if !path.exists() {
-            bail!(
-                "Register r{id} is not allocated in {}",
-                self.root.display()
-            );
+            bail!("Register r{id} is not allocated in {}", self.root.display());
         }
         let mut bytes = Vec::new();
         File::open(&path)
@@ -271,6 +292,78 @@ impl ShmStore {
             }
         }
         Ok(out)
+    }
+
+    /// Compute telemetry and memory usage statistics for the active `/dev/shm` namespace.
+    pub fn stats(&self) -> Result<ShmStats> {
+        let _guard = self.lock()?;
+        let manifest = self.read_manifest_unlocked()?;
+        let mut total_bytes = fs::metadata(self.manifest_path())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let mut by_type: BTreeMap<String, usize> = BTreeMap::new();
+
+        for &id in &manifest.allocated_ids {
+            let p = self.reg_path(id);
+            if let Ok(meta) = fs::metadata(&p) {
+                total_bytes += meta.len();
+            }
+            if let Ok(rec) = self.read_reg_unlocked(id) {
+                *by_type
+                    .entry(rec.value.type_name().to_string())
+                    .or_insert(0) += 1;
+            }
+        }
+
+        Ok(ShmStats {
+            shm_dir: self.root.to_string_lossy().into_owned(),
+            total_registers: manifest.allocated_ids.len(),
+            total_bytes,
+            next_id: manifest.next_id,
+            by_type,
+        })
+    }
+
+    /// Garbage-collect older registers, keeping only the `keep_last` most recent SSA registers
+    /// while preserving `next_id` monotonicity.
+    pub fn gc(&self, keep_last: usize) -> Result<GcReport> {
+        let _guard = self.lock()?;
+        let mut manifest = self.read_manifest_unlocked()?;
+        let total = manifest.allocated_ids.len();
+        if total <= keep_last {
+            return Ok(GcReport {
+                removed_registers: 0,
+                freed_bytes: 0,
+                retained_registers: total,
+                next_id: manifest.next_id,
+            });
+        }
+
+        let split_at = total - keep_last;
+        let to_remove: Vec<u32> = manifest.allocated_ids[..split_at].to_vec();
+        manifest.allocated_ids = manifest.allocated_ids[split_at..].to_vec();
+
+        let mut freed_bytes = 0u64;
+        for id in &to_remove {
+            let p = self.reg_path(*id);
+            if let Ok(meta) = fs::metadata(&p) {
+                freed_bytes += meta.len();
+            }
+            if p.exists() {
+                let _ = fs::remove_file(&p);
+            }
+        }
+
+        let encoded_manifest =
+            bincode::serialize(&manifest).context("Failed to serialize SSA manifest after GC")?;
+        Self::write_atomic(&self.manifest_path(), &encoded_manifest)?;
+
+        Ok(GcReport {
+            removed_registers: to_remove.len(),
+            freed_bytes,
+            retained_registers: manifest.allocated_ids.len(),
+            next_id: manifest.next_id,
+        })
     }
 
     /// Clear all registers and reset the SSA counter to `r0`.

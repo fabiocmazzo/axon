@@ -1,7 +1,8 @@
 use anyhow::Result;
 use axon::isa::{
     op_commit, op_filter, op_load_with_context, op_match, op_outline, op_patch, op_purge, op_scan,
-    op_set_algebra, op_sub, op_undo, op_xexec, FilterOpts, ScanOpts, SetOp,
+    op_set_algebra, op_slice, op_sub, op_undo, op_verify, op_write, op_xexec, FilterOpts,
+    ScanOpts, SetOp,
 };
 use axon::reg::{RegRef, RegisterRecord};
 use axon::shm::ShmStore;
@@ -73,6 +74,16 @@ enum Commands {
         /// Maximum file size in bytes (for PathSet)
         #[arg(long)]
         max_size: Option<u64>,
+    },
+
+    /// Paginate a register by slicing items in range [start..end) into a new SSA register
+    Slice {
+        /// Source register (e.g. r0, @r0, @last)
+        reg: String,
+        /// 0-based start index (inclusive)
+        start: usize,
+        /// 0-based end index (exclusive)
+        end: usize,
     },
 
     /// Compute set union of two SSA registers into a new register
@@ -171,10 +182,29 @@ enum Commands {
         with: String,
     },
 
+    /// Stage creation (or full replacement) of a file into a DiffSet register in SSA memory
+    Write {
+        /// Target file path to create or overwrite when committed
+        path: String,
+
+        /// Full text content for the file
+        content: String,
+    },
+
     /// Verify CAS hashes and atomically apply a staged DiffSet register to disk
     Commit {
         /// DiffSet register to commit (e.g. r2, @r2, @last)
         diff_reg: String,
+    },
+
+    /// Transactionally apply a DiffSet, run a test/check command, and auto-UNDO if the command exits non-zero
+    Verify {
+        /// DiffSet register to commit and verify (e.g. r2, @last)
+        diff_reg: String,
+
+        /// Verification command and arguments (e.g. cargo check)
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        cmd: Vec<String>,
     },
 
     /// Atomically roll back a COMMIT (or DiffSet) register to its pre-commit state from /dev/shm
@@ -217,6 +247,16 @@ enum Commands {
     /// List all allocated SSA registers in shared memory
     Regs,
 
+    /// Display shared-memory usage and register statistics in /dev/shm
+    Stats,
+
+    /// Garbage-collect old SSA registers in /dev/shm while keeping the N most recent registers
+    Gc {
+        /// Number of most recent SSA registers to retain
+        #[arg(short, long, default_value_t = 10)]
+        keep: usize,
+    },
+
     /// Inspect the detailed contents of an SSA register (supports indexing like `r0[0]` or `@last`)
     Inspect {
         /// Register reference (e.g. r0, @r0, @last, r0[2])
@@ -226,6 +266,10 @@ enum Commands {
         /// Maximum number of items to display
         #[arg(short, long)]
         limit: Option<usize>,
+
+        /// Maximum character budget for the inspection output (truncates deterministically)
+        #[arg(short = 'm', long)]
+        max_chars: Option<usize>,
     },
 
     /// Clear all SSA registers in the active shared-memory namespace
@@ -284,6 +328,10 @@ fn main() -> Result<()> {
                     max_size,
                 },
             )?;
+            print_record(&rec, cli.json)?;
+        }
+        Commands::Slice { reg, start, end } => {
+            let rec = op_slice(&store, None, &reg, start, end)?;
             print_record(&rec, cli.json)?;
         }
         Commands::Union { reg_a, reg_b } => {
@@ -345,8 +393,16 @@ fn main() -> Result<()> {
             )?;
             print_record(&rec, cli.json)?;
         }
+        Commands::Write { path, content } => {
+            let rec = op_write(&store, None, &path, &content)?;
+            print_record(&rec, cli.json)?;
+        }
         Commands::Commit { diff_reg } => {
             let rec = op_commit(&store, None, &diff_reg)?;
+            print_record(&rec, cli.json)?;
+        }
+        Commands::Verify { diff_reg, cmd } => {
+            let rec = op_verify(&store, None, &diff_reg, &cmd)?;
             print_record(&rec, cli.json)?;
         }
         Commands::Undo { reg, force } => {
@@ -402,18 +458,47 @@ fn main() -> Result<()> {
                 for entry in list {
                     println!(
                         "{} = {}({} items) [op: {}, origin: {}]",
-                        entry.name, entry.reg_type, entry.items, entry.opcode, entry.origin
+                        entry.name, entry.reg_type, entry.items, entry.opcode, e_origin(&entry.origin)
                     );
                 }
             }
         }
-        Commands::Inspect { reg, limit } => {
+        Commands::Stats => {
+            let st = store.stats()?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&st)?);
+            } else {
+                println!("SHM Directory   : {}", st.shm_dir);
+                println!("Active Registers: {}", st.total_registers);
+                println!("Total SHM Bytes : {} B", st.total_bytes);
+                println!("Next Physical ID: r{}", st.next_id);
+                for (ty, count) in &st.by_type {
+                    println!("  - {:<12}: {}", ty, count);
+                }
+            }
+        }
+        Commands::Gc { keep } => {
+            let rep = store.gc(keep)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&rep)?);
+            } else {
+                println!(
+                    "GC removed {} register(s) ({} B freed), retained {} register(s) (next_id: r{})",
+                    rep.removed_registers, rep.freed_bytes, rep.retained_registers, rep.next_id
+                );
+            }
+        }
+        Commands::Inspect {
+            reg,
+            limit,
+            max_chars,
+        } => {
             let reg_ref = RegRef::parse(&reg)?;
             let rec = store.resolve(&reg_ref)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&rec)?);
             } else {
-                print!("{}", rec.format_inspect(limit));
+                print!("{}", rec.format_inspect_with_budget(limit, max_chars));
             }
         }
         Commands::Reset => {
@@ -437,4 +522,8 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn e_origin(s: &str) -> &str {
+    s
 }

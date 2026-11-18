@@ -1,6 +1,7 @@
 use axon::isa::{
     op_commit, op_filter, op_load, op_load_with_context, op_match, op_outline, op_patch, op_purge,
-    op_scan, op_set_algebra, op_sub, op_undo, op_xexec, FilterOpts, ScanOpts, SetOp,
+    op_scan, op_set_algebra, op_slice, op_sub, op_undo, op_verify, op_write, op_xexec, FilterOpts,
+    ScanOpts, SetOp,
 };
 use axon::reg::{RegRef, RegValue};
 use axon::shm::ShmStore;
@@ -452,4 +453,157 @@ fn test_vm_virtual_ssa_renaming_across_runs_and_intra_run_ssa_violation() {
         err.to_string().contains("SSA_VIOLATION"),
         "Expected intra-script SSA_VIOLATION, got: {err}"
     );
+}
+
+#[test]
+fn test_write_new_file_and_transactional_verify_auto_rollback() {
+    let shm_tmp = tempdir().unwrap();
+    let work_tmp = tempdir().unwrap();
+
+    let existing_file = work_tmp.path().join("lib.rs");
+    let new_file = work_tmp.path().join("sub_mod/created.rs");
+    fs::write(&existing_file, "pub fn ok() -> i32 { 1 }\n").unwrap();
+
+    let store = ShmStore::open(Some(shm_tmp.path().to_path_buf())).unwrap();
+
+    // 1. Stage modification to existing_file and verify with failing command -> must auto-rollback!
+    let r0_bad_diff = op_sub(
+        &store,
+        None,
+        existing_file.to_str().unwrap(),
+        "1",
+        "BROKEN_TOKEN",
+        true,
+    )
+    .unwrap();
+
+    let r1_verify_fail = op_verify(
+        &store,
+        None,
+        &r0_bad_diff.name,
+        &[
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("grep -q BROKEN_TOKEN '{}' && exit 1", existing_file.display()),
+        ],
+    )
+    .unwrap();
+    assert_eq!(r1_verify_fail.opcode, "VERIFY_ROLLBACK");
+    // Because the check exited with code 1, existing_file must have been rolled back automatically!
+    assert_eq!(
+        fs::read_to_string(&existing_file).unwrap(),
+        "pub fn ok() -> i32 { 1 }\n"
+    );
+
+    // 2. Stage creation of a brand-new file in a subdirectory via WRITE
+    let r2_write = op_write(
+        &store,
+        None,
+        new_file.to_str().unwrap(),
+        "pub fn generated() -> bool { true }",
+    )
+    .unwrap();
+    assert!(!new_file.exists(), "WRITE must only stage in SSA memory");
+
+    // 3. VERIFY with failing command -> must create file during check and unlink it on rollback!
+    let r3_verify_new_fail = op_verify(
+        &store,
+        None,
+        &r2_write.name,
+        &[
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("test -f '{}' && exit 1", new_file.display()),
+        ],
+    )
+    .unwrap();
+    assert_eq!(r3_verify_new_fail.opcode, "VERIFY_ROLLBACK");
+    assert!(
+        !new_file.exists(),
+        "Failed VERIFY on newly created file must unlink it on rollback"
+    );
+
+    // 4. VERIFY with passing command -> file remains committed on disk!
+    let r4_verify_ok = op_verify(
+        &store,
+        None,
+        &r2_write.name,
+        &[
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("grep -q generated '{}'", new_file.display()),
+        ],
+    )
+    .unwrap();
+    assert_eq!(r4_verify_ok.opcode, "VERIFY_OK");
+    assert!(new_file.exists());
+
+    // 5. UNDO on the WRITE DiffSet register removes the created file cleanly
+    let _r5_undo = op_undo(&store, None, &r2_write.name, false).unwrap();
+    assert!(!new_file.exists());
+}
+
+#[test]
+fn test_slice_pagination_inspect_budget_and_shm_gc_stats() {
+    let shm_tmp = tempdir().unwrap();
+    let work_tmp = tempdir().unwrap();
+
+    for i in 0..5 {
+        fs::write(
+            work_tmp.path().join(format!("file_{i}.rs")),
+            format!("pub fn func_{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+
+    let store = ShmStore::open(Some(shm_tmp.path().to_path_buf())).unwrap();
+    let r0 = op_scan(
+        &store,
+        None,
+        &ScanOpts {
+            root: work_tmp.path().to_path_buf(),
+            glob: Some("*.rs".to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(r0.value.len(), 5);
+
+    // Paginate items [1..4) via SLICE -> 3 items
+    let r1 = op_slice(&store, None, &r0.name, 1, 4).unwrap();
+    assert_eq!(r1.opcode, "SLICE");
+    assert_eq!(r1.value.len(), 3);
+    let sliced_paths = r1.value.extract_paths();
+    assert!(sliced_paths[0].ends_with("file_1.rs"));
+    assert!(sliced_paths[2].ends_with("file_3.rs"));
+
+    // Test character budget truncation on INSPECT
+    let budgeted = r0.format_inspect_with_budget(None, Some(45));
+    assert!(budgeted.contains("truncated to 45 chars budget"));
+
+    // Allocate two more registers so total is 4 registers (r0, r1, r2, r3)
+    let _r2 = op_outline(&store, None, &r1.name).unwrap();
+    let _r3 = op_slice(&store, None, &r1.name, 0, 1).unwrap();
+
+    let st = store.stats().unwrap();
+    assert_eq!(st.total_registers, 4);
+    assert_eq!(st.next_id, 4);
+    assert!(st.total_bytes > 0);
+
+    // Garbage-collect keeping only the 2 most recent registers (r2 and r3)
+    let gc_rep = store.gc(2).unwrap();
+    assert_eq!(gc_rep.removed_registers, 2);
+    assert_eq!(gc_rep.retained_registers, 2);
+    assert_eq!(gc_rep.next_id, 4);
+    assert!(!store.is_allocated(0).unwrap());
+    assert!(!store.is_allocated(1).unwrap());
+    assert!(store.is_allocated(2).unwrap());
+    assert!(store.is_allocated(3).unwrap());
+
+    // Running a script starting at `r0 = ...` after GC must allocate r4 (not reuse retired r0!)
+    let root_str = work_tmp.path().to_string_lossy();
+    let post_gc_steps =
+        execute_program(&store, &format!(r#"r0 = SCAN "{root_str}" "*.rs""#)).unwrap();
+    assert_eq!(post_gc_steps[0].register.as_ref().unwrap().name, "r4");
+    assert_eq!(post_gc_steps[0].virtual_reg.as_deref(), Some("r0"));
 }

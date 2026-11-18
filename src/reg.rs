@@ -116,6 +116,8 @@ pub struct FilePatch {
     pub modified_hash: u64,
     pub original: String,
     pub modified: String,
+    #[serde(default)]
+    pub created_new: bool,
 }
 
 impl FilePatch {
@@ -129,6 +131,20 @@ impl FilePatch {
             modified_hash,
             original,
             modified,
+            created_new: false,
+        }
+    }
+
+    pub fn new_created(path: String, modified: String) -> Self {
+        let modified_hash = fnv1a_64(modified.as_bytes());
+        Self {
+            path,
+            replacements: 1,
+            base_hash: 0,
+            modified_hash,
+            original: String::new(),
+            modified,
+            created_new: true,
         }
     }
 
@@ -137,10 +153,14 @@ impl FilePatch {
         let old_lines: Vec<&str> = self.original.lines().collect();
         let new_lines: Vec<&str> = self.modified.lines().collect();
         let mut out = String::new();
-        out.push_str(&format!(
-            "      --- a/{}\n      +++ b/{}\n",
-            self.path, self.path
-        ));
+        if self.created_new {
+            out.push_str(&format!("      --- /dev/null\n      +++ b/{}\n", self.path));
+        } else {
+            out.push_str(&format!(
+                "      --- a/{}\n      +++ b/{}\n",
+                self.path, self.path
+            ));
+        }
 
         // Find common prefix and suffix to isolate changed lines cleanly
         let mut prefix = 0;
@@ -266,6 +286,24 @@ impl RegValue {
         })
     }
 
+    /// Project a sub-range `[start..end)` of elements as a new `RegValue` of the same variant.
+    pub fn slice_range(&self, start: usize, end: usize) -> Result<RegValue> {
+        if end < start {
+            bail!("Invalid SLICE range {start}..{end} (end must be >= start)");
+        }
+        let len = self.len();
+        let s = start.min(len);
+        let e = end.min(len);
+        Ok(match self {
+            RegValue::PathSet(v) => RegValue::PathSet(v[s..e].to_vec()),
+            RegValue::MatchSet(v) => RegValue::MatchSet(v[s..e].to_vec()),
+            RegValue::TextBuf(v) => RegValue::TextBuf(v[s..e].to_vec()),
+            RegValue::DiffSet(v) => RegValue::DiffSet(v[s..e].to_vec()),
+            RegValue::ExecResult(v) => RegValue::ExecResult(v[s..e].to_vec()),
+            RegValue::Tombstone(v) => RegValue::Tombstone(v[s..e].to_vec()),
+        })
+    }
+
     /// Extract deduplicated, deterministically ordered file paths referenced by this register.
     pub fn extract_paths(&self) -> Vec<String> {
         let mut set = BTreeSet::new();
@@ -332,6 +370,14 @@ impl RegisterRecord {
     }
 
     pub fn format_inspect(&self, limit: Option<usize>) -> String {
+        self.format_inspect_with_budget(limit, None)
+    }
+
+    pub fn format_inspect_with_budget(
+        &self,
+        limit: Option<usize>,
+        max_chars: Option<usize>,
+    ) -> String {
         let mut out = String::new();
         out.push_str(&self.summary_line());
         out.push('\n');
@@ -373,18 +419,26 @@ impl RegisterRecord {
             }
             RegValue::DiffSet(items) => {
                 for (i, patch) in items.iter().take(max_items).enumerate() {
-                    out.push_str(&format!(
-                        "  [{i}] {} ({} replacement(s), base_hash: {:016x})\n",
-                        patch.path, patch.replacements, patch.base_hash
-                    ));
+                    if patch.created_new {
+                        out.push_str(&format!(
+                            "  [{i}] {} (new file, modified_hash: {:016x})\n",
+                            patch.path, patch.modified_hash
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "  [{i}] {} ({} replacement(s), base_hash: {:016x})\n",
+                            patch.path, patch.replacements, patch.base_hash
+                        ));
+                    }
                     out.push_str(&patch.render_unified_diff(40));
                 }
             }
             RegValue::ExecResult(items) => {
                 for (i, rec) in items.iter().take(max_items).enumerate() {
                     out.push_str(&format!(
-                        "  [{i}] cmd={:?} exit={} stdout={:?} stderr={:?}\n",
+                        "  [{i}] cmd={:?} target={:?} exit={} stdout={:?} stderr={:?}\n",
                         rec.command,
+                        rec.target,
                         rec.exit_code,
                         rec.stdout.trim_end(),
                         rec.stderr.trim_end()
@@ -403,6 +457,15 @@ impl RegisterRecord {
                 "  ... ({} more item(s) omitted)\n",
                 self.value.len() - max_items
             ));
+        }
+
+        if let Some(budget) = max_chars {
+            if out.chars().count() > budget {
+                let truncated: String = out.chars().take(budget).collect();
+                return format!(
+                    "{truncated}\n  ... [truncated to {budget} chars budget]\n"
+                );
+            }
         }
 
         out

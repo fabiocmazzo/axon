@@ -1,6 +1,7 @@
 use crate::isa::{
     op_commit, op_filter, op_load_with_context, op_match, op_outline, op_patch, op_purge, op_scan,
-    op_set_algebra, op_sub, op_undo, op_xexec, FilterOpts, ScanOpts, SetOp,
+    op_set_algebra, op_slice, op_sub, op_undo, op_verify, op_write, op_xexec, FilterOpts,
+    ScanOpts, SetOp,
 };
 use crate::reg::{RegRef, RegisterRecord};
 use crate::shm::ShmStore;
@@ -163,11 +164,6 @@ fn remap_operand(operand: &str, local_bindings: &BTreeMap<u32, u32>) -> String {
     operand.to_string()
 }
 
-/// Resolve the physical allocation target for a virtual destination register ID:
-/// - Rejects duplicate assignment to the same virtual register within a single VM program (`SSA_VIOLATION`).
-/// - If the requested ID is free in `/dev/shm`, binds directly to `Some(v_id)`.
-/// - If already occupied in `/dev/shm` from a prior run, returns `None` so the store allocates the next
-///   monotonic physical SSA register and maps `v_id -> phys_id` in `local_bindings`.
 fn resolve_physical_target(
     store: &ShmStore,
     virtual_id: Option<u32>,
@@ -179,7 +175,7 @@ fn resolve_physical_target(
                 "SSA_VIOLATION: register r{v_id} is assigned multiple times in the same program (already bound to r{existing_phys})"
             );
         }
-        if store.is_allocated(v_id)? {
+        if store.is_used_or_retired(v_id)? {
             return Ok(None);
         }
         return Ok(Some(v_id));
@@ -333,6 +329,20 @@ pub fn execute_program(store: &ShmStore, script_or_path: &str) -> Result<Vec<VmS
                 let rec = op_filter(store, phys_target, &src_reg, &opts)?;
                 record_step(stmt, virtual_id, rec, &mut local_bindings)
             }
+            "SLICE" => {
+                if args.len() != 3 {
+                    bail!("SLICE requires <reg> <start> <end>");
+                }
+                let src_reg = remap_operand(&args[0], &local_bindings);
+                let start: usize = args[1]
+                    .parse()
+                    .map_err(|_| anyhow!("SLICE start index must be a non-negative integer"))?;
+                let end: usize = args[2]
+                    .parse()
+                    .map_err(|_| anyhow!("SLICE end index must be a non-negative integer"))?;
+                let rec = op_slice(store, phys_target, &src_reg, start, end)?;
+                record_step(stmt, virtual_id, rec, &mut local_bindings)
+            }
             "UNION" | "INTERSECT" | "DIFF" => {
                 if args.len() != 2 {
                     bail!("{op} requires <reg_a> <reg_b>");
@@ -482,12 +492,27 @@ pub fn execute_program(store: &ShmStore, script_or_path: &str) -> Result<Vec<VmS
                 let rec = op_patch(store, phys_target, &target, s, e, &rep)?;
                 record_step(stmt, virtual_id, rec, &mut local_bindings)
             }
+            "WRITE" | "CREATE" => {
+                if args.len() != 2 {
+                    bail!("WRITE requires <file_path> <content>");
+                }
+                let rec = op_write(store, phys_target, &args[0], &args[1])?;
+                record_step(stmt, virtual_id, rec, &mut local_bindings)
+            }
             "COMMIT" | "APPLY" => {
                 if args.is_empty() {
                     bail!("COMMIT requires <diff_reg>");
                 }
                 let diff_reg = remap_operand(&args[0], &local_bindings);
                 let rec = op_commit(store, phys_target, &diff_reg)?;
+                record_step(stmt, virtual_id, rec, &mut local_bindings)
+            }
+            "VERIFY" => {
+                if args.len() < 2 {
+                    bail!("VERIFY requires <diff_reg> <cmd> [args...]");
+                }
+                let diff_reg = remap_operand(&args[0], &local_bindings);
+                let rec = op_verify(store, phys_target, &diff_reg, &args[1..])?;
                 record_step(stmt, virtual_id, rec, &mut local_bindings)
             }
             "UNDO" | "ROLLBACK" => {
@@ -515,11 +540,36 @@ pub fn execute_program(store: &ShmStore, script_or_path: &str) -> Result<Vec<VmS
                 record_step(stmt, virtual_id, rec, &mut local_bindings)
             }
             "INSPECT" | "PRINT" => {
-                let raw_target = args.first().map(|s| s.as_str()).unwrap_or("@last");
+                let mut raw_target = "@last";
+                let mut limit = None;
+                let mut max_chars = None;
+                let mut i = 0;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "--limit" | "-l" => {
+                            i += 1;
+                            limit = Some(
+                                args.get(i)
+                                    .ok_or_else(|| anyhow!("INSPECT --limit requires a number"))?
+                                    .parse()?,
+                            );
+                        }
+                        "--max-chars" | "-m" => {
+                            i += 1;
+                            max_chars = Some(
+                                args.get(i)
+                                    .ok_or_else(|| anyhow!("INSPECT --max-chars requires a number"))?
+                                    .parse()?,
+                            );
+                        }
+                        positional => raw_target = positional,
+                    }
+                    i += 1;
+                }
                 let target = remap_operand(raw_target, &local_bindings);
                 let reg_ref = RegRef::parse(&target)?;
                 let rec = store.resolve(&reg_ref)?;
-                let formatted = rec.format_inspect(None);
+                let formatted = rec.format_inspect_with_budget(limit, max_chars);
                 VmStepOutput {
                     instruction: stmt,
                     virtual_reg: None,
@@ -541,6 +591,48 @@ pub fn execute_program(store: &ShmStore, script_or_path: &str) -> Result<Vec<VmS
                     virtual_reg: None,
                     register: None,
                     text_output: Some(lines.join("\n")),
+                }
+            }
+            "STATS" => {
+                let st = store.stats()?;
+                let text = format!(
+                    "SHM: {} | registers: {} | bytes: {} B | next_id: r{}",
+                    st.shm_dir, st.total_registers, st.total_bytes, st.next_id
+                );
+                VmStepOutput {
+                    instruction: stmt,
+                    virtual_reg: None,
+                    register: None,
+                    text_output: Some(text),
+                }
+            }
+            "GC" => {
+                let mut keep = 10usize;
+                let mut i = 0;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "--keep" | "-k" => {
+                            i += 1;
+                            keep = args
+                                .get(i)
+                                .ok_or_else(|| anyhow!("GC --keep requires a count"))?
+                                .parse()?;
+                        }
+                        positional => {
+                            keep = positional.parse()?;
+                        }
+                    }
+                    i += 1;
+                }
+                let rep = store.gc(keep)?;
+                VmStepOutput {
+                    instruction: stmt,
+                    virtual_reg: None,
+                    register: None,
+                    text_output: Some(format!(
+                        "GC removed {} register(s) ({} B freed), retained {} register(s)",
+                        rep.removed_registers, rep.freed_bytes, rep.retained_registers
+                    )),
                 }
             }
             "RESET" => {
